@@ -1,6 +1,7 @@
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from uuid import uuid4
 
 import certifi
 import psycopg
@@ -69,12 +70,13 @@ def save_document_chunks(
                 cursor.executemany(
                     """
                     INSERT INTO "UploadedDocumentChunk"
-                        ("uploadedDocumentId", "chunkIndex", "pageStart", "pageEnd", "text", "tokenCount", "metadata", "createdAt")
+                        ("id", "uploadedDocumentId", "chunkIndex", "pageStart", "pageEnd", "text", "tokenCount", "metadata", "createdAt")
                     VALUES
-                        (%s::uuid, %s, %s, %s, %s, %s, %s::jsonb, %s)
+                        (%s::uuid, %s::uuid, %s, %s, %s, %s, %s, %s::jsonb, %s)
                     """,
                     [
                         (
+                            str(uuid4()),
                             uploaded_document_id,
                             chunk.chunk_index,
                             chunk.page_start,
