@@ -7,8 +7,20 @@ from psycopg.types.json import Jsonb
 from app.schemas import ProcessedChunk
 
 
+def normalize_database_url(database_url: str) -> str:
+    if "sslmode=verify-full" not in database_url or "sslrootcert=" in database_url:
+        return database_url
+
+    separator = "&" if "?" in database_url else "?"
+    return f"{database_url}{separator}sslrootcert=system"
+
+
+def connect(database_url: str):
+    return psycopg.connect(normalize_database_url(database_url), connect_timeout=10)
+
+
 def mark_document_pending(database_url: str, uploaded_document_id: str) -> None:
-    with psycopg.connect(database_url) as connection:
+    with connect(database_url) as connection:
         with connection.cursor() as cursor:
             cursor.execute(
                 """
@@ -29,7 +41,7 @@ def save_document_chunks(
 ) -> None:
     now = datetime.now(UTC)
 
-    with psycopg.connect(database_url) as connection:
+    with connect(database_url) as connection:
         with connection.transaction():
             with connection.cursor() as cursor:
                 cursor.execute(
@@ -87,7 +99,7 @@ def save_document_chunks(
 
 
 def mark_document_failed(database_url: str, uploaded_document_id: str, error: str) -> None:
-    with psycopg.connect(database_url) as connection:
+    with connect(database_url) as connection:
         with connection.cursor() as cursor:
             cursor.execute(
                 """

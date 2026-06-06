@@ -103,7 +103,12 @@ def process_document(payload: ProcessRequest, settings: Settings = Depends(get_s
     except Exception as error:
         error_message = str(error) or "PDF processing failed."
         if payload.persist and settings.database_url:
-            mark_document_failed(settings.database_url, payload.uploaded_document_id, error_message)
+            try:
+                mark_document_failed(settings.database_url, payload.uploaded_document_id, error_message)
+            except Exception as update_error:
+                error_message = (
+                    f"{error_message} Failed to update document status: {update_error}"
+                )
 
         return ProcessResponse(
             uploadedDocumentId=payload.uploaded_document_id,
