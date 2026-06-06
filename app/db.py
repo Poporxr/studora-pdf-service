@@ -7,7 +7,7 @@ import certifi
 import psycopg
 from psycopg.types.json import Jsonb
 
-from app.schemas import ProcessedChunk
+from app.schemas import ProcessedChunk, ProcessedSection
 
 
 def normalize_database_url(database_url: str) -> str:
@@ -53,8 +53,15 @@ def save_document_chunks(
     uploaded_document_id: str,
     chunks: Sequence[ProcessedChunk],
     page_count: int,
+    sections: Sequence[ProcessedSection] | None = None,
+    status: str = "READY",
+    warnings: Sequence[str] | None = None,
+    outline: Sequence[dict[str, object]] | None = None,
 ) -> None:
     now = datetime.now(UTC)
+    sections = sections or []
+    warnings = warnings or []
+    outline = outline or []
 
     with connect(database_url) as connection:
         with connection.transaction():
@@ -66,23 +73,61 @@ def save_document_chunks(
                     """,
                     (uploaded_document_id,),
                 )
+                cursor.execute(
+                    """
+                    DELETE FROM "UploadedDocumentSection"
+                    WHERE "uploadedDocumentId" = %s::uuid
+                    """,
+                    (uploaded_document_id,),
+                )
+
+                if sections:
+                    cursor.executemany(
+                        """
+                        INSERT INTO "UploadedDocumentSection"
+                            ("id", "uploadedDocumentId", "parentSectionId", "level", "title", "headingPath", "pageStart", "pageEnd", "sortOrder", "confidence", "metadata", "createdAt")
+                        VALUES
+                            (%s::uuid, %s::uuid, %s::uuid, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s)
+                        """,
+                        [
+                            (
+                                section.id,
+                                uploaded_document_id,
+                                section.parent_section_id,
+                                section.level,
+                                section.title,
+                                section.heading_path,
+                                section.page_start,
+                                section.page_end,
+                                section.sort_order,
+                                section.confidence,
+                                Jsonb(section.metadata),
+                                now,
+                            )
+                            for section in sections
+                        ],
+                    )
 
                 cursor.executemany(
                     """
                     INSERT INTO "UploadedDocumentChunk"
-                        ("id", "uploadedDocumentId", "chunkIndex", "pageStart", "pageEnd", "text", "tokenCount", "metadata", "createdAt")
+                        ("id", "uploadedDocumentId", "sectionId", "chunkIndex", "pageStart", "pageEnd", "text", "tokenCount", "contentPreview", "previousChunkId", "nextChunkId", "metadata", "createdAt")
                     VALUES
-                        (%s::uuid, %s::uuid, %s, %s, %s, %s, %s, %s::jsonb, %s)
+                        (%s::uuid, %s::uuid, %s::uuid, %s, %s, %s, %s, %s, %s, %s::uuid, %s::uuid, %s::jsonb, %s)
                     """,
                     [
                         (
-                            str(uuid4()),
+                            chunk.id or str(uuid4()),
                             uploaded_document_id,
+                            chunk.section_id,
                             chunk.chunk_index,
                             chunk.page_start,
                             chunk.page_end,
                             chunk.text,
                             chunk.token_count,
+                            chunk.content_preview,
+                            chunk.previous_chunk_id,
+                            chunk.next_chunk_id,
                             Jsonb(chunk.metadata),
                             now,
                         )
@@ -100,13 +145,16 @@ def save_document_chunks(
                     WHERE "id" = %s::uuid
                     """,
                     (
-                        "READY",
+                        status,
                         now,
                         Jsonb(
                             {
                                 "pdfProcessing": {
+                                    "warnings": list(warnings),
+                                    "outline": list(outline),
                                     "pageCount": page_count,
                                     "chunkCount": len(chunks),
+                                    "sectionCount": len(sections),
                                     "processedBy": "studora-pdf-service",
                                 }
                             }

@@ -12,20 +12,47 @@ class ProcessRequest(BaseModel):
 
 
 class ProcessedChunk(BaseModel):
+    id: str | None = None
     chunk_index: int = Field(alias="chunkIndex")
     page_start: int | None = Field(default=None, alias="pageStart")
     page_end: int | None = Field(default=None, alias="pageEnd")
+    section_id: str | None = Field(default=None, alias="sectionId")
     text: str
     token_count: int = Field(alias="tokenCount")
+    content_preview: str | None = Field(default=None, alias="contentPreview")
+    previous_chunk_id: str | None = Field(default=None, alias="previousChunkId")
+    next_chunk_id: str | None = Field(default=None, alias="nextChunkId")
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ProcessedSection(BaseModel):
+    id: str
+    parent_section_id: str | None = Field(default=None, alias="parentSectionId")
+    level: int
+    title: str
+    heading_path: list[str] = Field(alias="headingPath")
+    page_start: int | None = Field(default=None, alias="pageStart")
+    page_end: int | None = Field(default=None, alias="pageEnd")
+    sort_order: int = Field(alias="sortOrder")
+    confidence: float | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class ProcessResponse(BaseModel):
     uploaded_document_id: str = Field(alias="uploadedDocumentId")
-    status: Literal["READY", "FAILED"]
+    status: Literal[
+        "READY",
+        "READY_WITH_WARNINGS",
+        "OCR_REQUIRED",
+        "LOW_CONFIDENCE_EXTRACTION",
+        "FAILED",
+    ]
     page_count: int = Field(alias="pageCount")
+    section_count: int = Field(default=0, alias="sectionCount")
     chunk_count: int = Field(alias="chunkCount")
     chunks: list[ProcessedChunk]
+    sections: list[ProcessedSection] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
     error: str | None = None
 
     model_config = {"populate_by_name": True}
