@@ -22,14 +22,44 @@ def health_check():
 
 def require_internal_secret(
     authorization: str | None = Header(default=None),
+    x_internal_job_secret: str | None = Header(default=None, alias="X-Internal-Job-Secret"),
     settings: Settings = Depends(get_settings),
 ) -> None:
-    expected = f"Bearer {settings.internal_job_secret}"
-    if authorization != expected:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid internal service credentials.",
-        )
+    expected = normalize_secret(settings.internal_job_secret)
+    bearer_token = None
+
+    if authorization:
+        header_value = authorization.strip()
+        if header_value.lower().startswith("bearer "):
+            bearer_token = header_value[7:]
+
+    candidates = [
+        bearer_token,
+        x_internal_job_secret,
+    ]
+
+    if any(normalize_secret(candidate) == expected for candidate in candidates):
+        return
+
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Invalid internal service credentials.",
+    )
+
+
+def normalize_secret(value: str | None) -> str:
+    if not value:
+        return ""
+
+    normalized = value.strip()
+    if (
+        len(normalized) >= 2
+        and normalized[0] == normalized[-1]
+        and normalized[0] in {"'", '"'}
+    ):
+        normalized = normalized[1:-1].strip()
+
+    return normalized
 
 
 @app.post("/process", response_model=ProcessResponse, dependencies=[Depends(require_internal_secret)])
