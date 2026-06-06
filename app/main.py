@@ -133,10 +133,11 @@ def process_document(payload: ProcessRequest, settings: Settings = Depends(get_s
         sections, warnings = detect_sections(pages)
         outline = build_outline(sections)
         chunks = chunk_sections(sections, settings)
+        processed_sections = [item.section for item in sections]
         processing_status = get_processing_status(
             chunk_count=len(chunks),
             page_count=page_count,
-            section_count=len(sections),
+            section_count=len(processed_sections),
             text_chars=text_chars,
             warnings=warnings,
         )
@@ -159,7 +160,7 @@ def process_document(payload: ProcessRequest, settings: Settings = Depends(get_s
                 payload.uploaded_document_id,
                 chunks,
                 page_count,
-                sections=sections,
+                sections=processed_sections,
                 status=processing_status,
                 warnings=warnings,
                 outline=outline,
@@ -177,10 +178,10 @@ def process_document(payload: ProcessRequest, settings: Settings = Depends(get_s
             uploadedDocumentId=payload.uploaded_document_id,
             status=processing_status,
             pageCount=page_count,
-            sectionCount=len(sections),
+            sectionCount=len(processed_sections),
             chunkCount=len(chunks),
             chunks=chunks,
-            sections=[item.section for item in sections],
+            sections=processed_sections,
             warnings=warnings,
         )
     except Exception as error:
