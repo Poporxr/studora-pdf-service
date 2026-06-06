@@ -1,6 +1,8 @@
 from collections.abc import Sequence
 from datetime import UTC, datetime
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
+import certifi
 import psycopg
 from psycopg.types.json import Jsonb
 
@@ -8,11 +10,21 @@ from app.schemas import ProcessedChunk
 
 
 def normalize_database_url(database_url: str) -> str:
-    if "sslmode=verify-full" not in database_url or "sslrootcert=" in database_url:
-        return database_url
+    parts = urlsplit(database_url.strip().strip("'\""))
+    query = dict(parse_qsl(parts.query, keep_blank_values=True))
 
-    separator = "&" if "?" in database_url else "?"
-    return f"{database_url}{separator}sslrootcert=system"
+    if query.get("sslmode") == "verify-full":
+        query["sslrootcert"] = certifi.where()
+
+    return urlunsplit(
+        (
+            parts.scheme,
+            parts.netloc,
+            parts.path,
+            urlencode(query),
+            parts.fragment,
+        )
+    )
 
 
 def connect(database_url: str):
