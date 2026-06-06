@@ -1,9 +1,14 @@
+import logging
+from time import perf_counter
+
 from fastapi import Depends, FastAPI, Header, HTTPException, status
 
 from app.config import Settings, get_settings
 from app.db import mark_document_failed, mark_document_pending, save_document_chunks
 from app.extraction import chunk_pages, extract_pdf_pages, read_pdf_bytes
 from app.schemas import ProcessRequest, ProcessResponse
+
+logger = logging.getLogger("studora_pdf_service")
 
 app = FastAPI(
     title="Studora PDF Service",
@@ -70,7 +75,16 @@ def process_document(payload: ProcessRequest, settings: Settings = Depends(get_s
             detail="DATABASE_URL is required when persist is enabled.",
         )
 
+    started_at = perf_counter()
+
     try:
+        logger.info(
+            "pdf processing started uploadedDocumentId=%s source=%s persist=%s",
+            payload.uploaded_document_id,
+            payload.source,
+            payload.persist,
+        )
+
         if payload.persist and settings.database_url:
             mark_document_pending(settings.database_url, payload.uploaded_document_id)
 
@@ -79,8 +93,27 @@ def process_document(payload: ProcessRequest, settings: Settings = Depends(get_s
             payload.file_path,
             settings,
         )
+        logger.info(
+            "pdf downloaded uploadedDocumentId=%s sizeBytes=%s",
+            payload.uploaded_document_id,
+            len(pdf_bytes),
+        )
+
         pages, page_count = extract_pdf_pages(pdf_bytes, settings)
+        logger.info(
+            "pdf extracted uploadedDocumentId=%s pageCount=%s textChars=%s",
+            payload.uploaded_document_id,
+            page_count,
+            sum(len(page.text) for page in pages),
+        )
+
         chunks = chunk_pages(pages, settings)
+        logger.info(
+            "pdf chunked uploadedDocumentId=%s chunkCount=%s elapsedSeconds=%.2f",
+            payload.uploaded_document_id,
+            len(chunks),
+            perf_counter() - started_at,
+        )
 
         if not chunks:
             raise ValueError("No extractable text chunks were found in this PDF.")
@@ -92,6 +125,12 @@ def process_document(payload: ProcessRequest, settings: Settings = Depends(get_s
                 chunks,
                 page_count,
             )
+            logger.info(
+                "pdf chunks saved uploadedDocumentId=%s chunkCount=%s elapsedSeconds=%.2f",
+                payload.uploaded_document_id,
+                len(chunks),
+                perf_counter() - started_at,
+            )
 
         return ProcessResponse(
             uploadedDocumentId=payload.uploaded_document_id,
@@ -102,6 +141,12 @@ def process_document(payload: ProcessRequest, settings: Settings = Depends(get_s
         )
     except Exception as error:
         error_message = str(error) or "PDF processing failed."
+        logger.exception(
+            "pdf processing failed uploadedDocumentId=%s error=%s",
+            payload.uploaded_document_id,
+            error_message,
+        )
+
         if payload.persist and settings.database_url:
             try:
                 mark_document_failed(settings.database_url, payload.uploaded_document_id, error_message)
@@ -109,12 +154,13 @@ def process_document(payload: ProcessRequest, settings: Settings = Depends(get_s
                 error_message = (
                     f"{error_message} Failed to update document status: {update_error}"
                 )
+                logger.exception(
+                    "pdf failure status update failed uploadedDocumentId=%s error=%s",
+                    payload.uploaded_document_id,
+                    update_error,
+                )
 
-        return ProcessResponse(
-            uploadedDocumentId=payload.uploaded_document_id,
-            status="FAILED",
-            pageCount=0,
-            chunkCount=0,
-            chunks=[],
-            error=error_message,
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=error_message,
         )

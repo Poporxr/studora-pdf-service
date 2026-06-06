@@ -31,6 +31,8 @@ def mark_document_pending(database_url: str, uploaded_document_id: str) -> None:
                 """,
                 ("PENDING", uploaded_document_id),
             )
+            if cursor.rowcount != 1:
+                raise ValueError("Uploaded document was not found in Studora.")
 
 
 def save_document_chunks(
@@ -52,14 +54,14 @@ def save_document_chunks(
                     (uploaded_document_id,),
                 )
 
-                for chunk in chunks:
-                    cursor.execute(
-                        """
-                        INSERT INTO "UploadedDocumentChunk"
-                            ("uploadedDocumentId", "chunkIndex", "pageStart", "pageEnd", "text", "tokenCount", "metadata", "createdAt")
-                        VALUES
-                            (%s::uuid, %s, %s, %s, %s, %s, %s::jsonb, %s)
-                        """,
+                cursor.executemany(
+                    """
+                    INSERT INTO "UploadedDocumentChunk"
+                        ("uploadedDocumentId", "chunkIndex", "pageStart", "pageEnd", "text", "tokenCount", "metadata", "createdAt")
+                    VALUES
+                        (%s::uuid, %s, %s, %s, %s, %s, %s::jsonb, %s)
+                    """,
+                    [
                         (
                             uploaded_document_id,
                             chunk.chunk_index,
@@ -69,8 +71,10 @@ def save_document_chunks(
                             chunk.token_count,
                             Jsonb(chunk.metadata),
                             now,
-                        ),
-                    )
+                        )
+                        for chunk in chunks
+                    ],
+                )
 
                 cursor.execute(
                     """
@@ -96,6 +100,8 @@ def save_document_chunks(
                         uploaded_document_id,
                     ),
                 )
+                if cursor.rowcount != 1:
+                    raise ValueError("Uploaded document could not be marked as ready.")
 
 
 def mark_document_failed(database_url: str, uploaded_document_id: str, error: str) -> None:
@@ -111,3 +117,5 @@ def mark_document_failed(database_url: str, uploaded_document_id: str, error: st
                 """,
                 ("FAILED", error[:1000], uploaded_document_id),
             )
+            if cursor.rowcount != 1:
+                raise ValueError("Uploaded document could not be marked as failed.")
