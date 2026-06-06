@@ -7,7 +7,7 @@ import certifi
 import psycopg
 from psycopg.types.json import Jsonb
 
-from app.schemas import ProcessedChunk, ProcessedSection
+from app.schemas import ProcessedChunk, ProcessedSection, ProcessedSummary
 
 
 def normalize_database_url(database_url: str) -> str:
@@ -54,18 +54,27 @@ def save_document_chunks(
     chunks: Sequence[ProcessedChunk],
     page_count: int,
     sections: Sequence[ProcessedSection] | None = None,
+    summaries: Sequence[ProcessedSummary] | None = None,
     status: str = "READY",
     warnings: Sequence[str] | None = None,
     outline: Sequence[dict[str, object]] | None = None,
 ) -> None:
     now = datetime.now(UTC)
     sections = sections or []
+    summaries = summaries or []
     warnings = warnings or []
     outline = outline or []
 
     with connect(database_url) as connection:
         with connection.transaction():
             with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    DELETE FROM "UploadedDocumentSummary"
+                    WHERE "uploadedDocumentId" = %s::uuid
+                    """,
+                    (uploaded_document_id,),
+                )
                 cursor.execute(
                     """
                     DELETE FROM "UploadedDocumentChunk"
@@ -132,8 +141,35 @@ def save_document_chunks(
                             now,
                         )
                         for chunk in chunks
-                    ],
-                )
+                        ],
+                    )
+
+                if summaries:
+                    cursor.executemany(
+                        """
+                        INSERT INTO "UploadedDocumentSummary"
+                            ("id", "uploadedDocumentId", "sectionId", "kind", "title", "summary", "keyPoints", "tokenCount", "model", "sourceVersion", "createdAt", "updatedAt")
+                        VALUES
+                            (%s::uuid, %s::uuid, %s::uuid, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        """,
+                        [
+                            (
+                                summary.id,
+                                uploaded_document_id,
+                                summary.section_id,
+                                summary.kind,
+                                summary.title,
+                                summary.summary,
+                                summary.key_points,
+                                summary.token_count,
+                                summary.model,
+                                summary.source_version,
+                                now,
+                                now,
+                            )
+                            for summary in summaries
+                        ],
+                    )
 
                 cursor.execute(
                     """
@@ -155,6 +191,7 @@ def save_document_chunks(
                                     "pageCount": page_count,
                                     "chunkCount": len(chunks),
                                     "sectionCount": len(sections),
+                                    "summaryCount": len(summaries),
                                     "processedBy": "studora-pdf-service",
                                 }
                             }

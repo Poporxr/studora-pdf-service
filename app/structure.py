@@ -22,6 +22,9 @@ QUESTION_PATTERN = re.compile(
     r"^(\d+[\.)]|\([a-z]\)|[a-z][\.)])\s*(explain|discuss|define|describe|state|calculate|compare|differentiate|analyze|evaluate|what|why|how)\b",
     re.IGNORECASE,
 )
+TOC_ENTRY_PATTERN = re.compile(
+    r"^(.{3,120}?)(\.{3,}|\s{3,}|\s+\|\s+).{0,30}\b\d{1,4}\s*$"
+)
 
 
 def is_upper_heading(text: str) -> bool:
@@ -47,6 +50,20 @@ def looks_title_case(text: str) -> bool:
     return title_words / len(words) >= 0.65
 
 
+def is_toc_entry(text: str) -> bool:
+    normalized = text.strip()
+    if not normalized:
+        return False
+
+    if TOC_ENTRY_PATTERN.match(normalized):
+        return True
+
+    if re.match(r"^\d+\s*\|\s+.{3,120}$", normalized):
+        return True
+
+    return False
+
+
 def get_font_baseline(pages: list[ExtractedPage]) -> float | None:
     sizes = [
         line.font_size
@@ -61,6 +78,9 @@ def get_font_baseline(pages: list[ExtractedPage]) -> float | None:
 def score_heading(line: ExtractedLine, baseline_font_size: float | None) -> tuple[int, int]:
     text = line.text.strip()
     if not text or len(text) > 140:
+        return 0, 0
+
+    if is_toc_entry(text):
         return 0, 0
 
     score = 0
@@ -154,6 +174,9 @@ def detect_sections(pages: list[ExtractedPage]) -> tuple[list[SectionText], list
         for line in page.lines:
             text = line.text.strip()
             if not text:
+                continue
+
+            if is_toc_entry(text):
                 continue
 
             score, level = score_heading(line, baseline_font_size)

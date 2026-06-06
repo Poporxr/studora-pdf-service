@@ -38,6 +38,18 @@ class ProcessedSection(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class ProcessedSummary(BaseModel):
+    id: str
+    section_id: str | None = Field(default=None, alias="sectionId")
+    kind: str
+    title: str | None = None
+    summary: str
+    key_points: list[str] = Field(default_factory=list, alias="keyPoints")
+    token_count: int | None = Field(default=None, alias="tokenCount")
+    model: str | None = None
+    source_version: str | None = Field(default=None, alias="sourceVersion")
+
+
 class ProcessResponse(BaseModel):
     uploaded_document_id: str = Field(alias="uploadedDocumentId")
     status: Literal[
@@ -52,6 +64,7 @@ class ProcessResponse(BaseModel):
     chunk_count: int = Field(alias="chunkCount")
     chunks: list[ProcessedChunk]
     sections: list[ProcessedSection] = Field(default_factory=list)
+    summaries: list[ProcessedSummary] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
     error: str | None = None
 

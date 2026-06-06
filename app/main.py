@@ -9,6 +9,7 @@ from app.db import mark_document_failed, mark_document_pending, save_document_ch
 from app.extraction import extract_pdf_pages, read_pdf_bytes
 from app.schemas import ProcessRequest, ProcessResponse
 from app.structure import build_outline, detect_sections
+from app.summaries import build_summaries
 
 logger = logging.getLogger("studora_pdf_service")
 
@@ -134,6 +135,7 @@ def process_document(payload: ProcessRequest, settings: Settings = Depends(get_s
         outline = build_outline(sections)
         chunks = chunk_sections(sections, settings)
         processed_sections = [item.section for item in sections]
+        summaries = build_summaries(sections, chunks)
         processing_status = get_processing_status(
             chunk_count=len(chunks),
             page_count=page_count,
@@ -142,10 +144,11 @@ def process_document(payload: ProcessRequest, settings: Settings = Depends(get_s
             warnings=warnings,
         )
         logger.info(
-            "pdf structured uploadedDocumentId=%s sectionCount=%s chunkCount=%s status=%s warnings=%s elapsedSeconds=%.2f",
+            "pdf structured uploadedDocumentId=%s sectionCount=%s chunkCount=%s summaryCount=%s status=%s warnings=%s elapsedSeconds=%.2f",
             payload.uploaded_document_id,
             len(sections),
             len(chunks),
+            len(summaries),
             processing_status,
             len(warnings),
             perf_counter() - started_at,
@@ -161,15 +164,17 @@ def process_document(payload: ProcessRequest, settings: Settings = Depends(get_s
                 chunks,
                 page_count,
                 sections=processed_sections,
+                summaries=summaries,
                 status=processing_status,
                 warnings=warnings,
                 outline=outline,
             )
             logger.info(
-                "pdf chunks saved uploadedDocumentId=%s sectionCount=%s chunkCount=%s status=%s elapsedSeconds=%.2f",
+                "pdf chunks saved uploadedDocumentId=%s sectionCount=%s chunkCount=%s summaryCount=%s status=%s elapsedSeconds=%.2f",
                 payload.uploaded_document_id,
                 len(sections),
                 len(chunks),
+                len(summaries),
                 processing_status,
                 perf_counter() - started_at,
             )
@@ -182,6 +187,7 @@ def process_document(payload: ProcessRequest, settings: Settings = Depends(get_s
             chunkCount=len(chunks),
             chunks=chunks,
             sections=processed_sections,
+            summaries=summaries,
             warnings=warnings,
         )
     except Exception as error:
