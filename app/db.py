@@ -9,6 +9,8 @@ from psycopg.types.json import Jsonb
 
 from app.schemas import ProcessedChunk, ProcessedSection, ProcessedSummary
 
+INSERT_BATCH_SIZE = 200
+
 
 def normalize_database_url(database_url: str) -> str:
     parts = urlsplit(database_url.strip().strip("'\""))
@@ -46,6 +48,11 @@ def mark_document_pending(database_url: str, uploaded_document_id: str) -> None:
             )
             if cursor.rowcount != 1:
                 raise ValueError("Uploaded document was not found in Studora.")
+
+
+def batch_items(items: Sequence, size: int = INSERT_BATCH_SIZE):
+    for start in range(0, len(items), size):
+        yield items[start : start + size]
 
 
 def save_document_chunks(
@@ -117,30 +124,31 @@ def save_document_chunks(
                         ],
                     )
 
-                cursor.executemany(
-                    """
-                    INSERT INTO "UploadedDocumentChunk"
-                        ("id", "uploadedDocumentId", "sectionId", "chunkIndex", "pageStart", "pageEnd", "text", "tokenCount", "contentPreview", "previousChunkId", "nextChunkId", "metadata", "createdAt")
-                    VALUES
-                        (%s::uuid, %s::uuid, %s::uuid, %s, %s, %s, %s, %s, %s, %s::uuid, %s::uuid, %s::jsonb, %s)
-                    """,
-                    [
-                        (
-                            chunk.id or str(uuid4()),
-                            uploaded_document_id,
-                            chunk.section_id,
-                            chunk.chunk_index,
-                            chunk.page_start,
-                            chunk.page_end,
-                            chunk.text,
-                            chunk.token_count,
-                            chunk.content_preview,
-                            chunk.previous_chunk_id,
-                            chunk.next_chunk_id,
-                            Jsonb(chunk.metadata),
-                            now,
-                        )
-                        for chunk in chunks
+                for chunk_batch in batch_items(chunks):
+                    cursor.executemany(
+                        """
+                        INSERT INTO "UploadedDocumentChunk"
+                            ("id", "uploadedDocumentId", "sectionId", "chunkIndex", "pageStart", "pageEnd", "text", "tokenCount", "contentPreview", "previousChunkId", "nextChunkId", "metadata", "createdAt")
+                        VALUES
+                            (%s::uuid, %s::uuid, %s::uuid, %s, %s, %s, %s, %s, %s, %s::uuid, %s::uuid, %s::jsonb, %s)
+                        """,
+                        [
+                            (
+                                chunk.id or str(uuid4()),
+                                uploaded_document_id,
+                                chunk.section_id,
+                                chunk.chunk_index,
+                                chunk.page_start,
+                                chunk.page_end,
+                                chunk.text,
+                                chunk.token_count,
+                                chunk.content_preview,
+                                chunk.previous_chunk_id,
+                                chunk.next_chunk_id,
+                                Jsonb(chunk.metadata),
+                                now,
+                            )
+                            for chunk in chunk_batch
                         ],
                     )
 

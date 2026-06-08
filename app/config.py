@@ -8,6 +8,8 @@ class Settings(BaseSettings):
     database_url: str | None = None
     max_pdf_mb: int = 30
     max_pdf_pages: int = 250
+    temporary_max_pdf_mb: int = 20
+    temporary_max_pdf_pages: int = 120
     max_chunk_tokens: int = 800
     chunk_overlap_tokens: int = 120
     request_timeout_seconds: int = 60

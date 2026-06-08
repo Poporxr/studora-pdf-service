@@ -1,12 +1,11 @@
 from dataclasses import dataclass
-from io import BytesIO
 from pathlib import Path
 import re
+import tempfile
 from typing import Any
 
 import fitz
 import httpx
-import pdfplumber
 
 from app.config import Settings
 
@@ -29,28 +28,74 @@ class ExtractedPage:
     text: str
 
 
-def read_pdf_bytes(file_url: str | None, file_path: str | None, settings: Settings) -> bytes:
-    if file_path:
-        path = Path(file_path)
-        if not path.exists():
-            raise ValueError("The provided PDF file path does not exist.")
-        data = path.read_bytes()
-    elif file_url:
-        with httpx.Client(timeout=settings.request_timeout_seconds, follow_redirects=True) as client:
-            response = client.get(file_url)
-            response.raise_for_status()
-            data = response.content
-    else:
-        raise ValueError("Either fileUrl or filePath is required.")
+def validate_pdf_file(path: Path, max_pdf_mb: int) -> None:
+    if not path.exists():
+        raise ValueError("The provided PDF file path does not exist.")
 
-    max_bytes = settings.max_pdf_mb * 1024 * 1024
-    if len(data) > max_bytes:
-        raise ValueError(f"PDF is larger than the configured {settings.max_pdf_mb}MB limit.")
+    size = path.stat().st_size
+    max_bytes = max_pdf_mb * 1024 * 1024
 
-    if not data:
+    if size > max_bytes:
+        raise ValueError(f"PDF is larger than the configured {max_pdf_mb}MB limit.")
+
+    if size <= 0:
         raise ValueError("PDF file is empty.")
 
-    return data
+
+def prepare_pdf_file(
+    file_url: str | None,
+    file_path: str | None,
+    settings: Settings,
+    *,
+    max_pdf_mb: int | None = None,
+) -> tuple[Path, bool]:
+    limit_mb = max_pdf_mb or settings.max_pdf_mb
+
+    if file_path:
+        path = Path(file_path)
+        validate_pdf_file(path, limit_mb)
+        return path, False
+
+    if not file_url:
+        raise ValueError("Either fileUrl or filePath is required.")
+
+    max_bytes = limit_mb * 1024 * 1024
+    downloaded = 0
+    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+    temp_path = Path(temp_file.name)
+
+    try:
+        with temp_file:
+            with httpx.Client(
+                timeout=settings.request_timeout_seconds,
+                follow_redirects=True,
+            ) as client:
+                with client.stream("GET", file_url) as response:
+                    response.raise_for_status()
+                    for chunk in response.iter_bytes():
+                        if not chunk:
+                            continue
+
+                        downloaded += len(chunk)
+                        if downloaded > max_bytes:
+                            raise ValueError(f"PDF is larger than the configured {limit_mb}MB limit.")
+
+                        temp_file.write(chunk)
+
+        validate_pdf_file(temp_path, limit_mb)
+        return temp_path, True
+    except Exception:
+        temp_path.unlink(missing_ok=True)
+        raise
+
+
+def read_pdf_bytes(file_url: str | None, file_path: str | None, settings: Settings) -> bytes:
+    path, should_cleanup = prepare_pdf_file(file_url, file_path, settings)
+    try:
+        return path.read_bytes()
+    finally:
+        if should_cleanup:
+            path.unlink(missing_ok=True)
 
 
 def clean_text(text: str) -> str:
@@ -108,100 +153,67 @@ def extract_line_from_pymupdf(
     )
 
 
-def extract_with_pymupdf(pdf_bytes: bytes, settings: Settings) -> tuple[list[ExtractedPage], int]:
-    document = fitz.open(stream=pdf_bytes, filetype="pdf")
+def extract_with_pymupdf(
+    pdf_path: Path,
+    settings: Settings,
+    *,
+    max_pdf_pages: int | None = None,
+) -> tuple[list[ExtractedPage], int]:
+    document = fitz.open(pdf_path)
     page_count = document.page_count
+    page_limit = max_pdf_pages or settings.max_pdf_pages
 
-    if page_count > settings.max_pdf_pages:
+    if page_count > page_limit:
         document.close()
-        raise ValueError(f"PDF has {page_count} pages, above the configured {settings.max_pdf_pages} page limit.")
+        raise ValueError(f"PDF has {page_count} pages, above the configured {page_limit} page limit.")
 
     pages: list[ExtractedPage] = []
-    for page_index in range(page_count):
-        page = document.load_page(page_index)
-        lines: list[ExtractedLine] = []
-        page_dict = page.get_text("dict")
+    try:
+        for page_index in range(page_count):
+            page = document.load_page(page_index)
+            lines: list[ExtractedLine] = []
+            page_dict = page.get_text("dict")
 
-        for block in page_dict.get("blocks", []):
-            for line in block.get("lines", []):
-                extracted_line = extract_line_from_pymupdf(line, page_index + 1)
-                if extracted_line:
-                    lines.append(extracted_line)
+            for block in page_dict.get("blocks", []):
+                for line in block.get("lines", []):
+                    extracted_line = extract_line_from_pymupdf(line, page_index + 1)
+                    if extracted_line:
+                        lines.append(extracted_line)
 
-        text = clean_text("\n".join(line.text for line in lines))
-        if not text:
-            text = clean_text(page.get_text("text"))
-            lines = [
-                ExtractedLine(
-                    bbox=None,
-                    font_name=None,
-                    font_size=None,
-                    is_bold=False,
-                    page_number=page_index + 1,
-                    text=line,
-                )
-                for line in text.splitlines()
-                if clean_line(line)
-            ]
+            text = clean_text("\n".join(line.text for line in lines))
+            if not text:
+                text = clean_text(page.get_text("text"))
+                lines = [
+                    ExtractedLine(
+                        bbox=None,
+                        font_name=None,
+                        font_size=None,
+                        is_bold=False,
+                        page_number=page_index + 1,
+                        text=line,
+                    )
+                    for line in text.splitlines()
+                    if clean_line(line)
+                ]
 
-        pages.append(
-            ExtractedPage(
-                extractor="pymupdf",
-                lines=lines,
-                page_number=page_index + 1,
-                text=text,
-            )
-        )
-
-    document.close()
-    return pages, page_count
-
-
-def extract_with_pdfplumber(pdf_bytes: bytes, settings: Settings) -> tuple[list[ExtractedPage], int]:
-    pages: list[ExtractedPage] = []
-
-    with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
-        page_count = len(pdf.pages)
-        if page_count > settings.max_pdf_pages:
-            raise ValueError(f"PDF has {page_count} pages, above the configured {settings.max_pdf_pages} page limit.")
-
-        for page_index, page in enumerate(pdf.pages):
-            text = clean_text(page.extract_text() or "")
-            lines = [
-                ExtractedLine(
-                    bbox=None,
-                    font_name=None,
-                    font_size=None,
-                    is_bold=False,
-                    page_number=page_index + 1,
-                    text=line,
-                )
-                for line in text.splitlines()
-                if clean_line(line)
-            ]
             pages.append(
                 ExtractedPage(
-                    extractor="pdfplumber",
+                    extractor="pymupdf",
                     lines=lines,
                     page_number=page_index + 1,
                     text=text,
                 )
             )
+    finally:
+        document.close()
 
     return pages, page_count
 
 
-def extract_pdf_pages(pdf_bytes: bytes, settings: Settings) -> tuple[list[ExtractedPage], int]:
-    pages, page_count = extract_with_pymupdf(pdf_bytes, settings)
-    extracted_chars = sum(len(page.text) for page in pages)
-
-    if extracted_chars >= 500 or page_count <= 2:
-        return pages, page_count
-
-    fallback_pages, fallback_page_count = extract_with_pdfplumber(pdf_bytes, settings)
-    fallback_chars = sum(len(page.text) for page in fallback_pages)
-
-    if fallback_chars > extracted_chars:
-        return fallback_pages, fallback_page_count
-
-    return pages, page_count
+def extract_pdf_pages(
+    pdf_path: Path,
+    settings: Settings,
+    *,
+    max_pdf_pages: int | None = None,
+) -> tuple[list[ExtractedPage], int]:
+    return extract_with_pymupdf(pdf_path, settings, max_pdf_pages=max_pdf_pages)
