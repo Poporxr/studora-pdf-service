@@ -101,6 +101,58 @@ def build_section_text(section: SectionText, chunks: list[ProcessedChunk]) -> st
     return "\n".join(line.text for line in section.lines)
 
 
+def build_section_summary(
+    section: SectionText,
+    chunks: list[ProcessedChunk],
+) -> tuple[ProcessedSummary | None, str | None]:
+    text = build_section_text(section, chunks)
+    cleaned = clean_text(text)
+    if not cleaned:
+        return None, None
+
+    sentences = pick_key_sentences(cleaned, section.section.title, limit=4)
+    section_summary = make_summary_text(sentences, max_chars=700)
+    if not section_summary:
+        return None, None
+
+    summary = None
+    if len(cleaned) >= 450:
+        summary = ProcessedSummary(
+            id=str(uuid4()),
+            sectionId=section.section.id,
+            kind="SECTION",
+            title=section.section.title,
+            summary=section_summary,
+            keyPoints=sentences[:5],
+            tokenCount=count_tokens(section_summary),
+            model=None,
+            sourceVersion=SUMMARY_SOURCE_VERSION,
+        )
+
+    return summary, f"{section.section.title}: {section_summary}"
+
+
+def build_document_summary(document_parts: list[str]) -> ProcessedSummary | None:
+    document_text = "\n".join(document_parts)
+    document_sentences = pick_key_sentences(document_text, "Document overview", limit=8)
+    document_summary = make_summary_text(document_sentences, max_chars=1200)
+
+    if not document_summary:
+        return None
+
+    return ProcessedSummary(
+        id=str(uuid4()),
+        sectionId=None,
+        kind="DOCUMENT",
+        title="Document overview",
+        summary=document_summary,
+        keyPoints=document_sentences[:8],
+        tokenCount=count_tokens(document_summary),
+        model=None,
+        sourceVersion=SUMMARY_SOURCE_VERSION,
+    )
+
+
 def build_summaries(
     sections: list[SectionText],
     chunks: list[ProcessedChunk],
@@ -117,54 +169,21 @@ def build_summaries(
     section_summary_count = 0
 
     for section in sections:
-        text = build_section_text(section, chunks_by_section.get(section.section.id, []))
-        cleaned = clean_text(text)
-        if not cleaned:
-            continue
-
-        sentences = pick_key_sentences(cleaned, section.section.title, limit=4)
-        section_summary = make_summary_text(sentences, max_chars=700)
-        if section_summary:
-            document_parts.append(f"{section.section.title}: {section_summary}")
-
+        summary, document_part = build_section_summary(
+            section,
+            chunks_by_section.get(section.section.id, []),
+        )
+        if document_part:
+            document_parts.append(document_part)
         if (
-            section_summary
+            summary
             and section_summary_count < max_section_summaries
-            and len(cleaned) >= 450
         ):
-            summaries.append(
-                ProcessedSummary(
-                    id=str(uuid4()),
-                    sectionId=section.section.id,
-                    kind="SECTION",
-                    title=section.section.title,
-                    summary=section_summary,
-                    keyPoints=sentences[:5],
-                    tokenCount=count_tokens(section_summary),
-                    model=None,
-                    sourceVersion=SUMMARY_SOURCE_VERSION,
-                )
-            )
+            summaries.append(summary)
             section_summary_count += 1
 
-    document_text = "\n".join(document_parts)
-    document_sentences = pick_key_sentences(document_text, "Document overview", limit=8)
-    document_summary = make_summary_text(document_sentences, max_chars=1200)
-
+    document_summary = build_document_summary(document_parts)
     if document_summary:
-        summaries.insert(
-            0,
-            ProcessedSummary(
-                id=str(uuid4()),
-                sectionId=None,
-                kind="DOCUMENT",
-                title="Document overview",
-                summary=document_summary,
-                keyPoints=document_sentences[:8],
-                tokenCount=count_tokens(document_summary),
-                model=None,
-                sourceVersion=SUMMARY_SOURCE_VERSION,
-            ),
-        )
+        summaries.insert(0, document_summary)
 
     return summaries

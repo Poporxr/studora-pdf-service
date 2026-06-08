@@ -89,15 +89,6 @@ def prepare_pdf_file(
         raise
 
 
-def read_pdf_bytes(file_url: str | None, file_path: str | None, settings: Settings) -> bytes:
-    path, should_cleanup = prepare_pdf_file(file_url, file_path, settings)
-    try:
-        return path.read_bytes()
-    finally:
-        if should_cleanup:
-            path.unlink(missing_ok=True)
-
-
 def clean_text(text: str) -> str:
     cleaned = text.replace("\x00", " ")
     cleaned = re.sub(r"[ \t]+", " ", cleaned)

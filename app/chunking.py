@@ -72,7 +72,13 @@ def make_chunk(
     )
 
 
-def chunk_sections(sections: list[SectionText], settings: Settings) -> list[ProcessedChunk]:
+def chunk_sections(
+    sections: list[SectionText],
+    settings: Settings,
+    *,
+    previous_chunk_id: str | None = None,
+    start_index: int = 0,
+) -> list[ProcessedChunk]:
     encoding = get_encoding()
     chunks: list[ProcessedChunk] = []
 
@@ -98,7 +104,7 @@ def chunk_sections(sections: list[SectionText], settings: Settings) -> list[Proc
             ):
                 chunks.append(
                     make_chunk(
-                        chunk_index=len(chunks),
+                        chunk_index=start_index + len(chunks),
                         encoding=encoding,
                         page_end=page_end,
                         page_start=page_start,
@@ -128,7 +134,7 @@ def chunk_sections(sections: list[SectionText], settings: Settings) -> list[Proc
                     if slice_text:
                         chunks.append(
                             make_chunk(
-                                chunk_index=len(chunks),
+                                chunk_index=start_index + len(chunks),
                                 encoding=encoding,
                                 page_end=page_end,
                                 page_start=page_start,
@@ -154,7 +160,7 @@ def chunk_sections(sections: list[SectionText], settings: Settings) -> list[Proc
         if len(current_parts) > 1:
             chunks.append(
                 make_chunk(
-                    chunk_index=len(chunks),
+                    chunk_index=start_index + len(chunks),
                     encoding=encoding,
                     page_end=page_end,
                     page_start=page_start,
@@ -166,6 +172,8 @@ def chunk_sections(sections: list[SectionText], settings: Settings) -> list[Proc
     for index, chunk in enumerate(chunks):
         if index > 0:
             chunk.previous_chunk_id = chunks[index - 1].id
+        elif previous_chunk_id:
+            chunk.previous_chunk_id = previous_chunk_id
         if index < len(chunks) - 1:
             chunk.next_chunk_id = chunks[index + 1].id
 
