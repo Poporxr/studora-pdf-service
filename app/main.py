@@ -3,7 +3,7 @@ import logging
 from time import perf_counter
 from uuid import uuid4
 
-from fastapi import Depends, FastAPI, Header, HTTPException, status
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile, status
 
 from app.chunking import chunk_sections
 from app.config import Settings, get_settings
@@ -19,7 +19,12 @@ from app.db import (
     update_document_chunk_next_id,
     update_document_section_page_end,
 )
-from app.extraction import extract_pdf_page_batches, extract_pdf_pages, prepare_pdf_file
+from app.extraction import (
+    extract_pdf_page_batches,
+    extract_pdf_pages,
+    prepare_pdf_file,
+    prepare_uploaded_pdf_file,
+)
 from app.schemas import ProcessedSection, ProcessRequest, ProcessResponse
 from app.structure import (
     SectionText,
@@ -39,6 +44,28 @@ app = FastAPI(
     description="PDF extraction, cleaning and chunking service for Studora",
     version="1.0.0",
 )
+
+
+def build_processing_http_error(error: Exception) -> HTTPException:
+    message = str(error) or "PDF processing failed."
+    lower_message = message.lower()
+
+    if isinstance(error, HTTPException):
+        return error
+
+    if isinstance(error, ValueError):
+        if "larger than" in lower_message or "above the configured" in lower_message:
+            return HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail=message)
+
+        if "only pdf" in lower_message or "must be a pdf" in lower_message:
+            return HTTPException(status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, detail=message)
+
+        return HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=message)
+
+    return HTTPException(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        detail=message,
+    )
 
 
 @app.get("/")
@@ -290,13 +317,61 @@ def process_pdf_request(
                     update_error,
                 )
 
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=error_message,
-        )
+        raise build_processing_http_error(error)
     finally:
         if should_cleanup and pdf_path:
             pdf_path.unlink(missing_ok=True)
+
+
+def process_temporary_pdf_path(
+    *,
+    payload: ProcessRequest,
+    pdf_path,
+    settings: Settings,
+    started_at: float,
+) -> ProcessResponse:
+    pages, page_count = extract_pdf_pages(
+        pdf_path,
+        settings,
+        max_pdf_pages=settings.temporary_max_pdf_pages,
+    )
+    text_chars = sum(len(page.text) for page in pages)
+    logger.info(
+        "temporary pdf extracted uploadedDocumentId=%s pageCount=%s textChars=%s elapsedSeconds=%.2f",
+        payload.uploaded_document_id,
+        page_count,
+        text_chars,
+        perf_counter() - started_at,
+    )
+
+    sections, warnings = detect_sections(pages)
+    del pages
+    gc.collect()
+    chunks = chunk_sections(sections, settings)
+    processed_sections = [item.section for item in sections]
+    summaries = build_summaries(sections, chunks)
+    processing_status = get_processing_status(
+        chunk_count=len(chunks),
+        page_count=page_count,
+        section_count=len(processed_sections),
+        text_chars=text_chars,
+        warnings=warnings,
+    )
+
+    if not chunks:
+        raise ValueError("No extractable text chunks were found in this PDF.")
+
+    return ProcessResponse(
+        uploadedDocumentId=payload.uploaded_document_id,
+        status=processing_status,
+        pageCount=page_count,
+        sectionCount=len(processed_sections),
+        chunkCount=len(chunks),
+        chunks=chunks,
+        sections=processed_sections,
+        summaries=summaries,
+        warnings=warnings,
+    )
 
 
 def process_resource_progressive(
@@ -559,10 +634,7 @@ def process_resource_progressive(
                 update_error,
             )
 
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=error_message,
-        )
+        raise build_processing_http_error(error)
     finally:
         if should_cleanup and pdf_path:
             pdf_path.unlink(missing_ok=True)
@@ -587,6 +659,46 @@ def extract_temporary(payload: ProcessRequest, settings: Settings = Depends(get_
         max_pdf_mb=settings.temporary_max_pdf_mb,
         max_pdf_pages=settings.temporary_max_pdf_pages,
     )
+
+
+@app.post("/extract-temporary/upload", response_model=ProcessResponse, dependencies=[Depends(require_internal_secret)])
+async def extract_temporary_upload(
+    file: UploadFile = File(...),
+    uploaded_document_id: str = Form(default="temporary-upload", alias="uploadedDocumentId"),
+    source: str = Form(default="temporary-upload"),
+    settings: Settings = Depends(get_settings),
+):
+    started_at = perf_counter()
+    pdf_path = None
+
+    try:
+        payload = ProcessRequest(
+            uploadedDocumentId=uploaded_document_id,
+            source=source,
+            persist=False,
+        )
+        pdf_path = await prepare_uploaded_pdf_file(
+            file,
+            settings,
+            max_pdf_mb=settings.temporary_max_pdf_mb,
+        )
+        return process_temporary_pdf_path(
+            payload=payload,
+            pdf_path=pdf_path,
+            settings=settings,
+            started_at=started_at,
+        )
+    except Exception as error:
+        error_message = str(error) or "Temporary PDF extraction failed."
+        logger.exception(
+            "temporary pdf upload extraction failed uploadedDocumentId=%s error=%s",
+            uploaded_document_id,
+            error_message,
+        )
+        raise build_processing_http_error(error)
+    finally:
+        if pdf_path:
+            pdf_path.unlink(missing_ok=True)
 
 
 @app.post("/process", response_model=ProcessResponse, dependencies=[Depends(require_internal_secret)])

@@ -89,6 +89,56 @@ def prepare_pdf_file(
         raise
 
 
+def validate_pdf_upload_metadata(content_type: str | None, filename: str | None) -> None:
+    normalized_type = (content_type or "").lower()
+    normalized_name = (filename or "").lower()
+
+    if normalized_type and normalized_type != "application/pdf":
+        raise ValueError("Only PDF uploads are supported for temporary extraction right now.")
+
+    if normalized_name and not normalized_name.endswith(".pdf"):
+        raise ValueError("Uploaded file must be a PDF.")
+
+
+async def prepare_uploaded_pdf_file(
+    upload_file,
+    settings: Settings,
+    *,
+    max_pdf_mb: int | None = None,
+) -> Path:
+    if upload_file is None:
+        raise ValueError("A PDF file is required.")
+
+    validate_pdf_upload_metadata(upload_file.content_type, upload_file.filename)
+
+    limit_mb = max_pdf_mb or settings.temporary_max_pdf_mb
+    max_bytes = limit_mb * 1024 * 1024
+    downloaded = 0
+    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+    temp_path = Path(temp_file.name)
+
+    try:
+        with temp_file:
+            while True:
+                chunk = await upload_file.read(1024 * 1024)
+                if not chunk:
+                    break
+
+                downloaded += len(chunk)
+                if downloaded > max_bytes:
+                    raise ValueError(f"PDF is larger than the configured {limit_mb}MB limit.")
+
+                temp_file.write(chunk)
+
+        validate_pdf_file(temp_path, limit_mb)
+        return temp_path
+    except Exception:
+        temp_path.unlink(missing_ok=True)
+        raise
+    finally:
+        await upload_file.close()
+
+
 def clean_text(text: str) -> str:
     cleaned = text.replace("\x00", " ")
     cleaned = re.sub(r"[ \t]+", " ", cleaned)
