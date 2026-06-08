@@ -1,3 +1,4 @@
+import gc
 import logging
 from time import perf_counter
 
@@ -6,7 +7,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, status
 from app.chunking import chunk_sections
 from app.config import Settings, get_settings
 from app.db import mark_document_failed, mark_document_pending, save_document_chunks
-from app.extraction import extract_pdf_pages, prepare_pdf_file
+from app.extraction import extract_pdf_page_batches, extract_pdf_pages, prepare_pdf_file
 from app.schemas import ProcessRequest, ProcessResponse
 from app.structure import build_outline, detect_sections
 from app.summaries import build_summaries
@@ -90,6 +91,45 @@ def get_processing_status(
     return "READY"
 
 
+def extract_pages_for_processing(
+    *,
+    max_pdf_pages: int,
+    payload: ProcessRequest,
+    pdf_path,
+    persist: bool,
+    settings: Settings,
+    started_at: float,
+):
+    if not persist:
+        pages, page_count = extract_pdf_pages(
+            pdf_path,
+            settings,
+            max_pdf_pages=max_pdf_pages,
+        )
+        return pages, page_count
+
+    pages = []
+    page_count = 0
+
+    for batch, page_count, page_start, page_end in extract_pdf_page_batches(
+        pdf_path,
+        settings,
+        max_pdf_pages=max_pdf_pages,
+    ):
+        pages.extend(batch)
+        logger.info(
+            "pdf extraction batch uploadedDocumentId=%s pages=%s-%s/%s retainedPages=%s elapsedSeconds=%.2f",
+            payload.uploaded_document_id,
+            page_start,
+            page_end,
+            page_count,
+            len(pages),
+            perf_counter() - started_at,
+        )
+
+    return pages, page_count
+
+
 def process_pdf_request(
     payload: ProcessRequest,
     settings: Settings,
@@ -131,10 +171,13 @@ def process_pdf_request(
             pdf_path,
         )
 
-        pages, page_count = extract_pdf_pages(
-            pdf_path,
-            settings,
+        pages, page_count = extract_pages_for_processing(
             max_pdf_pages=max_pdf_pages,
+            payload=payload,
+            pdf_path=pdf_path,
+            persist=persist,
+            settings=settings,
+            started_at=started_at,
         )
 
         text_chars = sum(len(page.text) for page in pages)
@@ -146,6 +189,8 @@ def process_pdf_request(
         )
 
         sections, warnings = detect_sections(pages)
+        del pages
+        gc.collect()
         outline = build_outline(sections)
         chunks = chunk_sections(sections, settings)
         processed_sections = [item.section for item in sections]

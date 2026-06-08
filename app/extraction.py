@@ -153,59 +153,91 @@ def extract_line_from_pymupdf(
     )
 
 
+def validate_page_count(document, page_limit: int) -> int:
+    page_count = document.page_count
+
+    if page_count > page_limit:
+        raise ValueError(f"PDF has {page_count} pages, above the configured {page_limit} page limit.")
+
+    return page_count
+
+
+def extract_pymupdf_page(document, page_index: int) -> ExtractedPage:
+    page = document.load_page(page_index)
+    lines: list[ExtractedLine] = []
+    page_dict = page.get_text("dict")
+
+    for block in page_dict.get("blocks", []):
+        for line in block.get("lines", []):
+            extracted_line = extract_line_from_pymupdf(line, page_index + 1)
+            if extracted_line:
+                lines.append(extracted_line)
+
+    text = clean_text("\n".join(line.text for line in lines))
+    if not text:
+        text = clean_text(page.get_text("text"))
+        lines = [
+            ExtractedLine(
+                bbox=None,
+                font_name=None,
+                font_size=None,
+                is_bold=False,
+                page_number=page_index + 1,
+                text=line,
+            )
+            for line in text.splitlines()
+            if clean_line(line)
+        ]
+
+    return ExtractedPage(
+        extractor="pymupdf",
+        lines=lines,
+        page_number=page_index + 1,
+        text=text,
+    )
+
+
+def extract_pdf_page_batches(
+    pdf_path: Path,
+    settings: Settings,
+    *,
+    max_pdf_pages: int | None = None,
+    batch_pages: int | None = None,
+):
+    page_limit = max_pdf_pages or settings.max_pdf_pages
+    batch_size = max(1, batch_pages or settings.extraction_batch_pages)
+    document = fitz.open(pdf_path)
+
+    try:
+        page_count = validate_page_count(document, page_limit)
+
+        for start in range(0, page_count, batch_size):
+            end = min(start + batch_size, page_count)
+            yield (
+                [extract_pymupdf_page(document, page_index) for page_index in range(start, end)],
+                page_count,
+                start + 1,
+                end,
+            )
+    finally:
+        document.close()
+
+
 def extract_with_pymupdf(
     pdf_path: Path,
     settings: Settings,
     *,
     max_pdf_pages: int | None = None,
 ) -> tuple[list[ExtractedPage], int]:
-    document = fitz.open(pdf_path)
-    page_count = document.page_count
-    page_limit = max_pdf_pages or settings.max_pdf_pages
-
-    if page_count > page_limit:
-        document.close()
-        raise ValueError(f"PDF has {page_count} pages, above the configured {page_limit} page limit.")
-
     pages: list[ExtractedPage] = []
-    try:
-        for page_index in range(page_count):
-            page = document.load_page(page_index)
-            lines: list[ExtractedLine] = []
-            page_dict = page.get_text("dict")
+    page_count = 0
 
-            for block in page_dict.get("blocks", []):
-                for line in block.get("lines", []):
-                    extracted_line = extract_line_from_pymupdf(line, page_index + 1)
-                    if extracted_line:
-                        lines.append(extracted_line)
-
-            text = clean_text("\n".join(line.text for line in lines))
-            if not text:
-                text = clean_text(page.get_text("text"))
-                lines = [
-                    ExtractedLine(
-                        bbox=None,
-                        font_name=None,
-                        font_size=None,
-                        is_bold=False,
-                        page_number=page_index + 1,
-                        text=line,
-                    )
-                    for line in text.splitlines()
-                    if clean_line(line)
-                ]
-
-            pages.append(
-                ExtractedPage(
-                    extractor="pymupdf",
-                    lines=lines,
-                    page_number=page_index + 1,
-                    text=text,
-                )
-            )
-    finally:
-        document.close()
+    for batch, page_count, _, _ in extract_pdf_page_batches(
+        pdf_path,
+        settings,
+        max_pdf_pages=max_pdf_pages,
+    ):
+        pages.extend(batch)
 
     return pages, page_count
 

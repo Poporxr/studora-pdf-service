@@ -10,6 +10,7 @@ class Settings(BaseSettings):
     max_pdf_pages: int = 250
     temporary_max_pdf_mb: int = 20
     temporary_max_pdf_pages: int = 120
+    extraction_batch_pages: int = 20
     max_chunk_tokens: int = 800
     chunk_overlap_tokens: int = 120
     request_timeout_seconds: int = 60
