@@ -22,6 +22,10 @@ class ProcessedChunk(BaseModel):
     content_preview: str | None = Field(default=None, alias="contentPreview")
     previous_chunk_id: str | None = Field(default=None, alias="previousChunkId")
     next_chunk_id: str | None = Field(default=None, alias="nextChunkId")
+    chunk_hash: str | None = Field(default=None, alias="chunkHash")
+    heading: str | None = None
+    heading_path: list[str] = Field(default_factory=list, alias="headingPath")
+    section_number: str | None = Field(default=None, alias="sectionNumber")
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 

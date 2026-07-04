@@ -156,9 +156,9 @@ def insert_document_chunks(
                 cursor.executemany(
                     """
                     INSERT INTO "UploadedDocumentChunk"
-                        ("id", "uploadedDocumentId", "sectionId", "chunkIndex", "pageStart", "pageEnd", "text", "tokenCount", "contentPreview", "previousChunkId", "nextChunkId", "metadata", "createdAt")
+                        ("id", "uploadedDocumentId", "sectionId", "chunkIndex", "pageStart", "pageEnd", "text", "tokenCount", "contentPreview", "previousChunkId", "nextChunkId", "chunkHash", "heading", "headingPath", "sectionNumber", "metadata", "createdAt")
                     VALUES
-                        (%s::uuid, %s::uuid, %s::uuid, %s, %s, %s, %s, %s, %s, %s::uuid, %s::uuid, %s::jsonb, %s)
+                        (%s::uuid, %s::uuid, %s::uuid, %s, %s, %s, %s, %s, %s, %s::uuid, %s::uuid, %s, %s, %s, %s, %s::jsonb, %s)
                     """,
                     [
                         (
@@ -173,6 +173,10 @@ def insert_document_chunks(
                             chunk.content_preview,
                             chunk.previous_chunk_id,
                             chunk.next_chunk_id,
+                            chunk.chunk_hash,
+                            chunk.heading,
+                            chunk.heading_path,
+                            chunk.section_number,
                             Jsonb(chunk.metadata),
                             now,
                         )
@@ -356,9 +360,9 @@ def save_document_chunks(
                     cursor.executemany(
                         """
                         INSERT INTO "UploadedDocumentChunk"
-                            ("id", "uploadedDocumentId", "sectionId", "chunkIndex", "pageStart", "pageEnd", "text", "tokenCount", "contentPreview", "previousChunkId", "nextChunkId", "metadata", "createdAt")
+                            ("id", "uploadedDocumentId", "sectionId", "chunkIndex", "pageStart", "pageEnd", "text", "tokenCount", "contentPreview", "previousChunkId", "nextChunkId", "chunkHash", "heading", "headingPath", "sectionNumber", "metadata", "createdAt")
                         VALUES
-                            (%s::uuid, %s::uuid, %s::uuid, %s, %s, %s, %s, %s, %s, %s::uuid, %s::uuid, %s::jsonb, %s)
+                            (%s::uuid, %s::uuid, %s::uuid, %s, %s, %s, %s, %s, %s, %s::uuid, %s::uuid, %s, %s, %s, %s, %s::jsonb, %s)
                         """,
                         [
                             (
@@ -373,6 +377,10 @@ def save_document_chunks(
                                 chunk.content_preview,
                                 chunk.previous_chunk_id,
                                 chunk.next_chunk_id,
+                                chunk.chunk_hash,
+                                chunk.heading,
+                                chunk.heading_path,
+                                chunk.section_number,
                                 Jsonb(chunk.metadata),
                                 now,
                             )
