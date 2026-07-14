@@ -1,5 +1,6 @@
 import gc
 import logging
+import threading
 from contextlib import nullcontext
 from time import perf_counter
 from uuid import uuid4
@@ -24,13 +25,14 @@ from app.db import (
     update_document_chunk_next_id,
     update_document_section_page_end,
 )
+from app.embeddings import EMBEDDING_DIMENSIONS, EMBEDDING_MODEL_NAME, embed_texts, preload_embedding_model
 from app.extraction import (
     extract_pdf_page_batches,
     extract_pdf_pages,
     prepare_pdf_file,
     prepare_uploaded_pdf_file,
 )
-from app.schemas import ProcessedSection, ProcessRequest, ProcessResponse
+from app.schemas import EmbedRequest, EmbedResponse, ProcessedSection, ProcessRequest, ProcessResponse
 from app.structure import (
     SectionText,
     build_heading_path,
@@ -49,6 +51,14 @@ app = FastAPI(
     description="PDF extraction, cleaning and chunking service for Studora",
     version="1.0.0",
 )
+
+
+@app.on_event("startup")
+def preload_models() -> None:
+    # Loads in the background so a cold model download never blocks the
+    # health check; the first /embed call after a fresh deploy will simply
+    # wait on the same lock if it's still in progress.
+    threading.Thread(target=preload_embedding_model, daemon=True).start()
 
 
 @app.on_event("shutdown")
@@ -748,4 +758,19 @@ def process_document(payload: ProcessRequest, settings: Settings = Depends(get_s
         persist=payload.persist,
         max_pdf_mb=settings.max_pdf_mb if payload.persist else settings.temporary_max_pdf_mb,
         max_pdf_pages=settings.max_pdf_pages if payload.persist else settings.temporary_max_pdf_pages,
+    )
+
+
+MAX_EMBED_TEXT_CHARS = 4000
+
+
+@app.post("/embed", response_model=EmbedResponse, dependencies=[Depends(require_internal_secret)])
+def embed(payload: EmbedRequest):
+    texts = [text[:MAX_EMBED_TEXT_CHARS] for text in payload.texts]
+    embeddings = embed_texts(texts)
+
+    return EmbedResponse(
+        embeddings=embeddings,
+        dimensions=EMBEDDING_DIMENSIONS,
+        model=EMBEDDING_MODEL_NAME,
     )

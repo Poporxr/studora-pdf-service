@@ -54,6 +54,16 @@ class ProcessedSummary(BaseModel):
     source_version: str | None = Field(default=None, alias="sourceVersion")
 
 
+class EmbedRequest(BaseModel):
+    texts: list[str] = Field(min_length=1, max_length=100)
+
+
+class EmbedResponse(BaseModel):
+    embeddings: list[list[float]]
+    dimensions: int
+    model: str
+
+
 class ProcessResponse(BaseModel):
     uploaded_document_id: str = Field(alias="uploadedDocumentId")
     status: Literal[
