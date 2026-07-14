@@ -1,5 +1,6 @@
 import hashlib
 import re
+from functools import lru_cache
 from uuid import uuid4
 
 from app.config import Settings
@@ -16,6 +17,7 @@ class ApproximateEncoding:
         return re.sub(r"\s+([.,;:!?)])", r"\1", text)
 
 
+@lru_cache(maxsize=1)
 def get_encoding():
     try:
         import tiktoken

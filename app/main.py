@@ -1,5 +1,6 @@
 import gc
 import logging
+from contextlib import nullcontext
 from time import perf_counter
 from uuid import uuid4
 
@@ -8,15 +9,18 @@ from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadF
 from app.chunking import chunk_sections
 from app.config import Settings, get_settings
 from app.db import (
-    acquire_processing_lock,
+    checkout_connection,
+    close_pools,
     finish_document_processing,
     insert_document_chunks,
     insert_document_sections,
     insert_document_summaries,
     mark_document_failed,
     mark_document_pending,
+    release_connection,
     reset_document_processing_content,
     save_document_chunks,
+    try_lock_document,
     update_document_chunk_next_id,
     update_document_section_page_end,
 )
@@ -45,6 +49,11 @@ app = FastAPI(
     description="PDF extraction, cleaning and chunking service for Studora",
     version="1.0.0",
 )
+
+
+@app.on_event("shutdown")
+def shutdown_db_pools() -> None:
+    close_pools()
 
 
 def build_processing_http_error(error: Exception) -> HTTPException:
@@ -209,99 +218,106 @@ def process_pdf_request(
         )
 
         if persist and settings.database_url:
-            lock_connection = acquire_processing_lock(settings.database_url, payload.uploaded_document_id)
-            mark_document_pending(settings.database_url, payload.uploaded_document_id)
+            lock_connection = checkout_connection(settings.database_url)
 
-        pdf_path, should_cleanup = prepare_pdf_file(
-            str(payload.file_url) if payload.file_url else None,
-            payload.file_path,
-            settings,
-            max_pdf_mb=max_pdf_mb,
-        )
-        logger.info(
-            "pdf prepared uploadedDocumentId=%s path=%s",
-            payload.uploaded_document_id,
-            pdf_path,
-        )
+        transaction_ctx = lock_connection.transaction() if lock_connection else nullcontext()
 
-        pages, page_count = extract_pages_for_processing(
-            max_pdf_pages=max_pdf_pages,
-            payload=payload,
-            pdf_path=pdf_path,
-            persist=persist,
-            settings=settings,
-            started_at=started_at,
-        )
+        with transaction_ctx:
+            if lock_connection:
+                if not try_lock_document(lock_connection, payload.uploaded_document_id):
+                    raise FileExistsError("Uploaded document is already being processed.")
+                mark_document_pending(lock_connection, payload.uploaded_document_id)
 
-        text_chars = sum(len(page.text) for page in pages)
-        logger.info(
-            "pdf extracted uploadedDocumentId=%s pageCount=%s textChars=%s",
-            payload.uploaded_document_id,
-            page_count,
-            text_chars,
-        )
-
-        sections, warnings = detect_sections(pages)
-        del pages
-        gc.collect()
-        outline = build_outline(sections)
-        chunks = chunk_sections(sections, settings)
-        processed_sections = [item.section for item in sections]
-        summaries = build_summaries(sections, chunks)
-        processing_status = get_processing_status(
-            chunk_count=len(chunks),
-            page_count=page_count,
-            section_count=len(processed_sections),
-            text_chars=text_chars,
-            warnings=warnings,
-        )
-        logger.info(
-            "pdf structured uploadedDocumentId=%s sectionCount=%s chunkCount=%s summaryCount=%s status=%s warnings=%s elapsedSeconds=%.2f",
-            payload.uploaded_document_id,
-            len(sections),
-            len(chunks),
-            len(summaries),
-            processing_status,
-            len(warnings),
-            perf_counter() - started_at,
-        )
-
-        if not chunks:
-            raise ValueError("No extractable text chunks were found in this PDF.")
-
-        if persist and settings.database_url:
-            save_document_chunks(
-                settings.database_url,
-                payload.uploaded_document_id,
-                chunks,
-                page_count,
-                sections=processed_sections,
-                summaries=summaries,
-                status=processing_status,
-                warnings=warnings,
-                outline=outline,
+            pdf_path, should_cleanup = prepare_pdf_file(
+                str(payload.file_url) if payload.file_url else None,
+                payload.file_path,
+                settings,
+                max_pdf_mb=max_pdf_mb,
             )
             logger.info(
-                "pdf chunks saved uploadedDocumentId=%s sectionCount=%s chunkCount=%s summaryCount=%s status=%s elapsedSeconds=%.2f",
+                "pdf prepared uploadedDocumentId=%s path=%s",
+                payload.uploaded_document_id,
+                pdf_path,
+            )
+
+            pages, page_count = extract_pages_for_processing(
+                max_pdf_pages=max_pdf_pages,
+                payload=payload,
+                pdf_path=pdf_path,
+                persist=persist,
+                settings=settings,
+                started_at=started_at,
+            )
+
+            text_chars = sum(len(page.text) for page in pages)
+            logger.info(
+                "pdf extracted uploadedDocumentId=%s pageCount=%s textChars=%s",
+                payload.uploaded_document_id,
+                page_count,
+                text_chars,
+            )
+
+            sections, warnings = detect_sections(pages)
+            del pages
+            gc.collect()
+            outline = build_outline(sections)
+            chunks = chunk_sections(sections, settings)
+            processed_sections = [item.section for item in sections]
+            summaries = build_summaries(sections, chunks)
+            processing_status = get_processing_status(
+                chunk_count=len(chunks),
+                page_count=page_count,
+                section_count=len(processed_sections),
+                text_chars=text_chars,
+                warnings=warnings,
+            )
+            logger.info(
+                "pdf structured uploadedDocumentId=%s sectionCount=%s chunkCount=%s summaryCount=%s status=%s warnings=%s elapsedSeconds=%.2f",
                 payload.uploaded_document_id,
                 len(sections),
                 len(chunks),
                 len(summaries),
                 processing_status,
+                len(warnings),
                 perf_counter() - started_at,
             )
 
-        return ProcessResponse(
-            uploadedDocumentId=payload.uploaded_document_id,
-            status=processing_status,
-            pageCount=page_count,
-            sectionCount=len(processed_sections),
-            chunkCount=len(chunks),
-            chunks=[] if persist else chunks,
-            sections=[] if persist else processed_sections,
-            summaries=[] if persist else summaries,
-            warnings=warnings,
-        )
+            if not chunks:
+                raise ValueError("No extractable text chunks were found in this PDF.")
+
+            if lock_connection:
+                save_document_chunks(
+                    lock_connection,
+                    payload.uploaded_document_id,
+                    chunks,
+                    page_count,
+                    sections=processed_sections,
+                    summaries=summaries,
+                    status=processing_status,
+                    warnings=warnings,
+                    outline=outline,
+                )
+                logger.info(
+                    "pdf chunks saved uploadedDocumentId=%s sectionCount=%s chunkCount=%s summaryCount=%s status=%s elapsedSeconds=%.2f",
+                    payload.uploaded_document_id,
+                    len(sections),
+                    len(chunks),
+                    len(summaries),
+                    processing_status,
+                    perf_counter() - started_at,
+                )
+
+            return ProcessResponse(
+                uploadedDocumentId=payload.uploaded_document_id,
+                status=processing_status,
+                pageCount=page_count,
+                sectionCount=len(processed_sections),
+                chunkCount=len(chunks),
+                chunks=[] if persist else chunks,
+                sections=[] if persist else processed_sections,
+                summaries=[] if persist else summaries,
+                warnings=warnings,
+            )
     except Exception as error:
         error_message = str(error) or "PDF processing failed."
         
@@ -312,9 +328,10 @@ def process_pdf_request(
                 error_message,
             )
 
-            if persist and settings.database_url:
+            if persist and settings.database_url and lock_connection:
                 try:
-                    mark_document_failed(settings.database_url, payload.uploaded_document_id, error_message)
+                    with lock_connection.transaction():
+                        mark_document_failed(lock_connection, payload.uploaded_document_id, error_message)
                 except Exception as update_error:
                     error_message = (
                         f"{error_message} Failed to update document status: {update_error}"
@@ -330,7 +347,7 @@ def process_pdf_request(
         if should_cleanup and pdf_path:
             pdf_path.unlink(missing_ok=True)
         if lock_connection:
-            lock_connection.close()
+            release_connection(settings.database_url, lock_connection)
 
 
 def process_temporary_pdf_path(
@@ -421,7 +438,7 @@ def process_resource_progressive(
         if section.id in inserted_section_ids:
             return
 
-        insert_document_sections(settings.database_url, payload.uploaded_document_id, [section])
+        insert_document_sections(lock_connection, payload.uploaded_document_id, [section])
         inserted_section_ids.add(section.id)
         section_count += 1
 
@@ -445,7 +462,7 @@ def process_resource_progressive(
             return
 
         update_document_section_page_end(
-            settings.database_url,
+            lock_connection,
             current.section.id,
             current.section.page_end,
         )
@@ -458,9 +475,9 @@ def process_resource_progressive(
 
         if chunks:
             if last_chunk_id and chunks[0].id:
-                update_document_chunk_next_id(settings.database_url, last_chunk_id, chunks[0].id)
+                update_document_chunk_next_id(lock_connection, last_chunk_id, chunks[0].id)
 
-            insert_document_chunks(settings.database_url, payload.uploaded_document_id, chunks)
+            insert_document_chunks(lock_connection, payload.uploaded_document_id, chunks)
             summary, document_part = build_section_summary(current, chunks)
             if document_part:
                 document_parts.append(document_part)
@@ -484,153 +501,157 @@ def process_resource_progressive(
             payload.uploaded_document_id,
             payload.source,
         )
-        lock_connection = acquire_processing_lock(settings.database_url, payload.uploaded_document_id)
-        mark_document_pending(settings.database_url, payload.uploaded_document_id)
-        reset_document_processing_content(settings.database_url, payload.uploaded_document_id)
+        lock_connection = checkout_connection(settings.database_url)
 
-        pdf_path, should_cleanup = prepare_pdf_file(
-            str(payload.file_url) if payload.file_url else None,
-            payload.file_path,
-            settings,
-            max_pdf_mb=max_pdf_mb,
-        )
+        with lock_connection.transaction():
+            if not try_lock_document(lock_connection, payload.uploaded_document_id):
+                raise FileExistsError("Uploaded document is already being processed.")
 
-        for batch, page_count, page_start, page_end in extract_pdf_page_batches(
-            pdf_path,
-            settings,
-            max_pdf_pages=max_pdf_pages,
-        ):
-            if baseline_font_size is None:
-                baseline_font_size = get_font_baseline(batch)
+            mark_document_pending(lock_connection, payload.uploaded_document_id)
+            reset_document_processing_content(lock_connection, payload.uploaded_document_id)
 
-            for page in batch:
-                text_chars += len(page.text)
-                for line in page.lines:
-                    text = line.text.strip()
-                    if not text or is_toc_entry(text):
-                        continue
+            pdf_path, should_cleanup = prepare_pdf_file(
+                str(payload.file_url) if payload.file_url else None,
+                payload.file_path,
+                settings,
+                max_pdf_mb=max_pdf_mb,
+            )
 
-                    score, level = score_heading(line, baseline_font_size)
-                    if score >= 4:
-                        flush_current()
+            for batch, page_count, page_start, page_end in extract_pdf_page_batches(
+                pdf_path,
+                settings,
+                max_pdf_pages=max_pdf_pages,
+            ):
+                if baseline_font_size is None:
+                    baseline_font_size = get_font_baseline(batch)
 
-                        while stack and stack[-1].level >= level:
-                            stack.pop()
+                for page in batch:
+                    text_chars += len(page.text)
+                    for line in page.lines:
+                        text = line.text.strip()
+                        if not text or is_toc_entry(text):
+                            continue
 
-                        section = ProcessedSection(
-                            id=str(uuid4()),
-                            parentSectionId=stack[-1].id if stack else None,
-                            level=level,
-                            title=text[:180],
-                            headingPath=build_heading_path(stack, text[:180], level),
-                            pageStart=page.page_number,
-                            pageEnd=page.page_number,
-                            sortOrder=section_count,
-                            confidence=min(score / 8, 0.98),
-                            metadata={
-                                "fontSize": line.font_size,
-                                "isBold": line.is_bold,
-                                "detectorScore": score,
-                            },
-                        )
-                        insert_section(section)
-                        current = SectionText(section=section)
-                        stack.append(section)
-                        continue
+                        score, level = score_heading(line, baseline_font_size)
+                        if score >= 4:
+                            flush_current()
 
-                    if current is None:
-                        section = ProcessedSection(
-                            id=str(uuid4()),
-                            parentSectionId=None,
-                            level=1,
-                            title="Document start",
-                            headingPath=["Document start"],
-                            pageStart=page.page_number,
-                            pageEnd=page.page_number,
-                            sortOrder=section_count,
-                            confidence=0.4,
-                            metadata={"generatedFallback": True},
-                        )
-                        insert_section(section)
-                        current = SectionText(section=section)
-                        stack = [section]
+                            while stack and stack[-1].level >= level:
+                                stack.pop()
 
-                    current.lines.append(line)
-                    current.section.page_end = page.page_number
+                            section = ProcessedSection(
+                                id=str(uuid4()),
+                                parentSectionId=stack[-1].id if stack else None,
+                                level=level,
+                                title=text[:180],
+                                headingPath=build_heading_path(stack, text[:180], level),
+                                pageStart=page.page_number,
+                                pageEnd=page.page_number,
+                                sortOrder=section_count,
+                                confidence=min(score / 8, 0.98),
+                                metadata={
+                                    "fontSize": line.font_size,
+                                    "isBold": line.is_bold,
+                                    "detectorScore": score,
+                                },
+                            )
+                            insert_section(section)
+                            current = SectionText(section=section)
+                            stack.append(section)
+                            continue
+
+                        if current is None:
+                            section = ProcessedSection(
+                                id=str(uuid4()),
+                                parentSectionId=None,
+                                level=1,
+                                title="Document start",
+                                headingPath=["Document start"],
+                                pageStart=page.page_number,
+                                pageEnd=page.page_number,
+                                sortOrder=section_count,
+                                confidence=0.4,
+                                metadata={"generatedFallback": True},
+                            )
+                            insert_section(section)
+                            current = SectionText(section=section)
+                            stack = [section]
+
+                        current.lines.append(line)
+                        current.section.page_end = page.page_number
+
+                flush_current()
+                logger.info(
+                    "pdf resource batch saved uploadedDocumentId=%s pages=%s-%s/%s sections=%s chunks=%s textChars=%s elapsedSeconds=%.2f",
+                    payload.uploaded_document_id,
+                    page_start,
+                    page_end,
+                    page_count,
+                    section_count,
+                    chunk_count,
+                    text_chars,
+                    perf_counter() - started_at,
+                )
 
             flush_current()
-            gc.collect()
-            logger.info(
-                "pdf resource batch saved uploadedDocumentId=%s pages=%s-%s/%s sections=%s chunks=%s textChars=%s elapsedSeconds=%.2f",
+
+            if section_count <= 1 and text_chars > 2000:
+                warnings.append("Document structure confidence is low; sections were streamed with fallback metadata.")
+            elif section_count < max(2, page_count // 20):
+                warnings.append("Few headings were detected; section metadata may be incomplete.")
+
+            processing_status = get_processing_status(
+                chunk_count=chunk_count,
+                page_count=page_count,
+                section_count=section_count,
+                text_chars=text_chars,
+                warnings=warnings,
+            )
+            if chunk_count == 0:
+                raise ValueError("No extractable text chunks were found in this PDF.")
+
+            document_summary = build_document_summary(document_parts)
+            summaries = [*section_summaries]
+            if document_summary:
+                summaries.insert(0, document_summary)
+            insert_document_summaries(lock_connection, payload.uploaded_document_id, summaries)
+
+            finish_document_processing(
+                lock_connection,
                 payload.uploaded_document_id,
-                page_start,
-                page_end,
+                chunk_count=chunk_count,
+                outline=outline,
+                page_count=page_count,
+                section_count=section_count,
+                status=processing_status,
+                summary_count=len(summaries),
+                warnings=warnings,
+            )
+            logger.info(
+                "pdf resource processing finished uploadedDocumentId=%s pageCount=%s sectionCount=%s chunkCount=%s summaryCount=%s status=%s elapsedSeconds=%.2f",
+                payload.uploaded_document_id,
                 page_count,
                 section_count,
                 chunk_count,
-                text_chars,
+                len(summaries),
+                processing_status,
                 perf_counter() - started_at,
             )
 
-        flush_current()
-
-        if section_count <= 1 and text_chars > 2000:
-            warnings.append("Document structure confidence is low; sections were streamed with fallback metadata.")
-        elif section_count < max(2, page_count // 20):
-            warnings.append("Few headings were detected; section metadata may be incomplete.")
-
-        processing_status = get_processing_status(
-            chunk_count=chunk_count,
-            page_count=page_count,
-            section_count=section_count,
-            text_chars=text_chars,
-            warnings=warnings,
-        )
-        if chunk_count == 0:
-            raise ValueError("No extractable text chunks were found in this PDF.")
-
-        document_summary = build_document_summary(document_parts)
-        summaries = [*section_summaries]
-        if document_summary:
-            summaries.insert(0, document_summary)
-        insert_document_summaries(settings.database_url, payload.uploaded_document_id, summaries)
-
-        finish_document_processing(
-            settings.database_url,
-            payload.uploaded_document_id,
-            chunk_count=chunk_count,
-            outline=outline,
-            page_count=page_count,
-            section_count=section_count,
-            status=processing_status,
-            summary_count=len(summaries),
-            warnings=warnings,
-        )
-        logger.info(
-            "pdf resource processing finished uploadedDocumentId=%s pageCount=%s sectionCount=%s chunkCount=%s summaryCount=%s status=%s elapsedSeconds=%.2f",
-            payload.uploaded_document_id,
-            page_count,
-            section_count,
-            chunk_count,
-            len(summaries),
-            processing_status,
-            perf_counter() - started_at,
-        )
-
-        return ProcessResponse(
-            uploadedDocumentId=payload.uploaded_document_id,
-            status=processing_status,
-            pageCount=page_count,
-            sectionCount=section_count,
-            chunkCount=chunk_count,
-            chunks=[],
-            sections=[],
-            summaries=[],
-            warnings=warnings,
-        )
+            return ProcessResponse(
+                uploadedDocumentId=payload.uploaded_document_id,
+                status=processing_status,
+                pageCount=page_count,
+                sectionCount=section_count,
+                chunkCount=chunk_count,
+                chunks=[],
+                sections=[],
+                summaries=[],
+                warnings=warnings,
+            )
     except Exception as error:
         error_message = str(error) or "PDF processing failed."
-        
+
         if not isinstance(error, FileExistsError):
             logger.exception(
                 "pdf resource processing failed uploadedDocumentId=%s error=%s",
@@ -638,22 +659,24 @@ def process_resource_progressive(
                 error_message,
             )
 
-            try:
-                mark_document_failed(settings.database_url, payload.uploaded_document_id, error_message)
-            except Exception as update_error:
-                error_message = f"{error_message} Failed to update document status: {update_error}"
-                logger.exception(
-                    "pdf resource failure status update failed uploadedDocumentId=%s error=%s",
-                    payload.uploaded_document_id,
-                    update_error,
-                )
+            if lock_connection:
+                try:
+                    with lock_connection.transaction():
+                        mark_document_failed(lock_connection, payload.uploaded_document_id, error_message)
+                except Exception as update_error:
+                    error_message = f"{error_message} Failed to update document status: {update_error}"
+                    logger.exception(
+                        "pdf resource failure status update failed uploadedDocumentId=%s error=%s",
+                        payload.uploaded_document_id,
+                        update_error,
+                    )
 
         raise build_processing_http_error(error)
     finally:
         if should_cleanup and pdf_path:
             pdf_path.unlink(missing_ok=True)
         if lock_connection:
-            lock_connection.close()
+            release_connection(settings.database_url, lock_connection)
 
 
 @app.post("/process-resource", response_model=ProcessResponse, dependencies=[Depends(require_internal_secret)])
