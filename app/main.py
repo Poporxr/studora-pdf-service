@@ -477,6 +477,7 @@ def process_resource_progressive(
 
         current.lines.clear()
 
+    lock_connection = None
     try:
         logger.info(
             "pdf resource processing started uploadedDocumentId=%s source=%s",
