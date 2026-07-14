@@ -55,7 +55,7 @@ class ProcessedSummary(BaseModel):
 
 
 class EmbedRequest(BaseModel):
-    texts: list[str] = Field(min_length=1, max_length=100)
+    texts: list[str] = Field(min_length=1, max_length=10)
 
 
 class EmbedResponse(BaseModel):
