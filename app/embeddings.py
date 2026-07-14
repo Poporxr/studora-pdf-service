@@ -2,8 +2,8 @@ import threading
 
 from fastembed import TextEmbedding
 
-EMBEDDING_MODEL_NAME = "BAAI/bge-base-en-v1.5"
-EMBEDDING_DIMENSIONS = 768
+EMBEDDING_MODEL_NAME = "BAAI/bge-small-en-v1.5"
+EMBEDDING_DIMENSIONS = 384
 
 _model: TextEmbedding | None = None
 _model_lock = threading.Lock()
