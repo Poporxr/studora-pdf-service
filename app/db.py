@@ -34,6 +34,26 @@ def connect(database_url: str):
     return psycopg.connect(normalize_database_url(database_url), connect_timeout=10)
 
 
+def acquire_processing_lock(database_url: str, uploaded_document_id: str):
+    import hashlib
+    lock_key = int(hashlib.sha256(uploaded_document_id.encode("utf-8")).hexdigest()[:15], 16)
+    
+    connection = connect(database_url)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT pg_try_advisory_lock(%s)", (lock_key,))
+            locked = cursor.fetchone()[0]
+            
+        if not locked:
+            connection.close()
+            raise FileExistsError("Uploaded document is already being processed.")
+            
+        return connection
+    except Exception:
+        connection.close()
+        raise
+
+
 def mark_document_pending(database_url: str, uploaded_document_id: str) -> None:
     with connect(database_url) as connection:
         with connection.cursor() as cursor:
@@ -42,18 +62,12 @@ def mark_document_pending(database_url: str, uploaded_document_id: str) -> None:
                 UPDATE "UploadedDocument"
                 SET "processingStatus" = %s::"UploadedDocumentProcessingStatus",
                     "processingError" = NULL
-                WHERE "id" = %s::uuid AND ("processingStatus" IS NULL OR "processingStatus" != 'PENDING')
-                RETURNING "id"
+                WHERE "id" = %s::uuid
                 """,
                 ("PENDING", uploaded_document_id),
             )
             if cursor.rowcount == 0:
-                cursor.execute('SELECT "processingStatus" FROM "UploadedDocument" WHERE "id" = %s::uuid', (uploaded_document_id,))
-                row = cursor.fetchone()
-                if not row:
-                    raise ValueError("Uploaded document was not found in Studora.")
-                if row[0] == "PENDING":
-                    raise FileExistsError("Uploaded document is already being processed.")
+                raise ValueError("Uploaded document was not found in Studora.")
 
 
 def reset_document_processing_content(database_url: str, uploaded_document_id: str) -> None:

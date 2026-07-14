@@ -8,6 +8,7 @@ from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadF
 from app.chunking import chunk_sections
 from app.config import Settings, get_settings
 from app.db import (
+    acquire_processing_lock,
     finish_document_processing,
     insert_document_chunks,
     insert_document_sections,
@@ -197,6 +198,7 @@ def process_pdf_request(
     started_at = perf_counter()
     pdf_path = None
     should_cleanup = False
+    lock_connection = None
 
     try:
         logger.info(
@@ -207,6 +209,7 @@ def process_pdf_request(
         )
 
         if persist and settings.database_url:
+            lock_connection = acquire_processing_lock(settings.database_url, payload.uploaded_document_id)
             mark_document_pending(settings.database_url, payload.uploaded_document_id)
 
         pdf_path, should_cleanup = prepare_pdf_file(
@@ -326,6 +329,8 @@ def process_pdf_request(
     finally:
         if should_cleanup and pdf_path:
             pdf_path.unlink(missing_ok=True)
+        if lock_connection:
+            lock_connection.close()
 
 
 def process_temporary_pdf_path(
@@ -478,6 +483,7 @@ def process_resource_progressive(
             payload.uploaded_document_id,
             payload.source,
         )
+        lock_connection = acquire_processing_lock(settings.database_url, payload.uploaded_document_id)
         mark_document_pending(settings.database_url, payload.uploaded_document_id)
         reset_document_processing_content(settings.database_url, payload.uploaded_document_id)
 
@@ -645,6 +651,8 @@ def process_resource_progressive(
     finally:
         if should_cleanup and pdf_path:
             pdf_path.unlink(missing_ok=True)
+        if lock_connection:
+            lock_connection.close()
 
 
 @app.post("/process-resource", response_model=ProcessResponse, dependencies=[Depends(require_internal_secret)])
