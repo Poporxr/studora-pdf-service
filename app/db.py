@@ -42,12 +42,18 @@ def mark_document_pending(database_url: str, uploaded_document_id: str) -> None:
                 UPDATE "UploadedDocument"
                 SET "processingStatus" = %s::"UploadedDocumentProcessingStatus",
                     "processingError" = NULL
-                WHERE "id" = %s::uuid
+                WHERE "id" = %s::uuid AND ("processingStatus" IS NULL OR "processingStatus" != 'PENDING')
+                RETURNING "id"
                 """,
                 ("PENDING", uploaded_document_id),
             )
-            if cursor.rowcount != 1:
-                raise ValueError("Uploaded document was not found in Studora.")
+            if cursor.rowcount == 0:
+                cursor.execute('SELECT "processingStatus" FROM "UploadedDocument" WHERE "id" = %s::uuid', (uploaded_document_id,))
+                row = cursor.fetchone()
+                if not row:
+                    raise ValueError("Uploaded document was not found in Studora.")
+                if row[0] == "PENDING":
+                    raise FileExistsError("Uploaded document is already being processed.")
 
 
 def reset_document_processing_content(database_url: str, uploaded_document_id: str) -> None:

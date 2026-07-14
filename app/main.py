@@ -53,6 +53,9 @@ def build_processing_http_error(error: Exception) -> HTTPException:
     if isinstance(error, HTTPException):
         return error
 
+    if isinstance(error, FileExistsError):
+        return HTTPException(status_code=status.HTTP_409_CONFLICT, detail=message)
+
     if isinstance(error, ValueError):
         if "larger than" in lower_message or "above the configured" in lower_message:
             return HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail=message)
@@ -298,24 +301,26 @@ def process_pdf_request(
         )
     except Exception as error:
         error_message = str(error) or "PDF processing failed."
-        logger.exception(
-            "pdf processing failed uploadedDocumentId=%s error=%s",
-            payload.uploaded_document_id,
-            error_message,
-        )
+        
+        if not isinstance(error, FileExistsError):
+            logger.exception(
+                "pdf processing failed uploadedDocumentId=%s error=%s",
+                payload.uploaded_document_id,
+                error_message,
+            )
 
-        if persist and settings.database_url:
-            try:
-                mark_document_failed(settings.database_url, payload.uploaded_document_id, error_message)
-            except Exception as update_error:
-                error_message = (
-                    f"{error_message} Failed to update document status: {update_error}"
-                )
-                logger.exception(
-                    "pdf failure status update failed uploadedDocumentId=%s error=%s",
-                    payload.uploaded_document_id,
-                    update_error,
-                )
+            if persist and settings.database_url:
+                try:
+                    mark_document_failed(settings.database_url, payload.uploaded_document_id, error_message)
+                except Exception as update_error:
+                    error_message = (
+                        f"{error_message} Failed to update document status: {update_error}"
+                    )
+                    logger.exception(
+                        "pdf failure status update failed uploadedDocumentId=%s error=%s",
+                        payload.uploaded_document_id,
+                        update_error,
+                    )
 
         raise build_processing_http_error(error)
     finally:
@@ -618,21 +623,23 @@ def process_resource_progressive(
         )
     except Exception as error:
         error_message = str(error) or "PDF processing failed."
-        logger.exception(
-            "pdf resource processing failed uploadedDocumentId=%s error=%s",
-            payload.uploaded_document_id,
-            error_message,
-        )
-
-        try:
-            mark_document_failed(settings.database_url, payload.uploaded_document_id, error_message)
-        except Exception as update_error:
-            error_message = f"{error_message} Failed to update document status: {update_error}"
+        
+        if not isinstance(error, FileExistsError):
             logger.exception(
-                "pdf resource failure status update failed uploadedDocumentId=%s error=%s",
+                "pdf resource processing failed uploadedDocumentId=%s error=%s",
                 payload.uploaded_document_id,
-                update_error,
+                error_message,
             )
+
+            try:
+                mark_document_failed(settings.database_url, payload.uploaded_document_id, error_message)
+            except Exception as update_error:
+                error_message = f"{error_message} Failed to update document status: {update_error}"
+                logger.exception(
+                    "pdf resource failure status update failed uploadedDocumentId=%s error=%s",
+                    payload.uploaded_document_id,
+                    update_error,
+                )
 
         raise build_processing_http_error(error)
     finally:
