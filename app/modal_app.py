@@ -46,6 +46,37 @@ class _ExtractionSettings:
         self.request_timeout_seconds = 60
 
 
+FIRST_PAGE_THUMBNAIL_DPI = 120
+FIRST_PAGE_THUMBNAIL_MAX_WIDTH = 900
+
+
+def render_first_page_thumbnail(pdf_path) -> str | None:
+    """Renders page 1 to a JPEG, base64-encoded for the JSON response. Best
+    effort: a thumbnail failure should never fail the whole processing job."""
+    import base64
+
+    import fitz
+
+    document = None
+    try:
+        document = fitz.open(pdf_path)
+        if document.page_count == 0:
+            return None
+
+        page = document.load_page(0)
+        zoom = FIRST_PAGE_THUMBNAIL_DPI / 72
+        if page.rect.width > 0:
+            zoom = min(zoom, FIRST_PAGE_THUMBNAIL_MAX_WIDTH / page.rect.width)
+
+        pixmap = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
+        return base64.b64encode(pixmap.tobytes("jpeg", jpg_quality=70)).decode("ascii")
+    except Exception:
+        return None
+    finally:
+        if document is not None:
+            document.close()
+
+
 @app.function(cpu=1.0, memory=2048, timeout=180)
 def process_pdf(
     *,
@@ -79,6 +110,7 @@ def process_pdf(
             settings,
             max_pdf_mb=max_pdf_mb,
         )
+        thumbnail_base64 = render_first_page_thumbnail(pdf_path)
         pages, page_count = extract_pdf_pages(pdf_path, settings, max_pdf_pages=max_pdf_pages)
         text_chars = sum(len(page.text) for page in pages)
 
@@ -94,6 +126,7 @@ def process_pdf(
             "outline": outline,
             "pageCount": page_count,
             "textChars": text_chars,
+            "thumbnailBase64": thumbnail_base64,
             "warnings": warnings,
         }
     finally:

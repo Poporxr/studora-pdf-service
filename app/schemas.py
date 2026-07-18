@@ -79,6 +79,7 @@ class ProcessResponse(BaseModel):
     chunks: list[ProcessedChunk]
     sections: list[ProcessedSection] = Field(default_factory=list)
     summaries: list[ProcessedSummary] = Field(default_factory=list)
+    thumbnail_base64: str | None = Field(default=None, alias="thumbnailBase64")
     warnings: list[str] = Field(default_factory=list)
     error: str | None = None
 

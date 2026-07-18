@@ -480,6 +480,7 @@ def process_resource_progressive(
                 chunks=[],
                 sections=[],
                 summaries=[],
+                thumbnailBase64=result.get("thumbnailBase64"),
                 warnings=warnings,
             )
     except Exception as error:
