@@ -1,6 +1,5 @@
 import gc
 import logging
-import threading
 from contextlib import nullcontext
 from time import perf_counter
 
@@ -23,7 +22,6 @@ from app.db import (
     save_document_chunks,
     try_lock_document,
 )
-from app.embeddings import EMBEDDING_DIMENSIONS, EMBEDDING_MODEL_NAME, embed_texts, preload_embedding_model
 from app.extraction import extract_pdf_pages, prepare_uploaded_pdf_file
 from app.schemas import (
     EmbedRequest,
@@ -39,19 +37,15 @@ from app.summaries import build_summaries
 
 logger = logging.getLogger("studora_pdf_service")
 
+EMBEDDING_MODEL_NAME = "BAAI/bge-small-en-v1.5"
+EMBEDDING_DIMENSIONS = 384
+MAX_EMBED_TEXT_CHARS = 4000
+
 app = FastAPI(
     title="Studora PDF Service",
     description="PDF extraction, cleaning and chunking service for Studora",
     version="1.0.0",
 )
-
-
-@app.on_event("startup")
-def preload_models() -> None:
-    # Loads in the background so a cold model download never blocks the
-    # health check; the first /embed call after a fresh deploy will simply
-    # wait on the same lock if it's still in progress.
-    threading.Thread(target=preload_embedding_model, daemon=True).start()
 
 
 @app.on_event("shutdown")
@@ -155,6 +149,7 @@ def get_processing_status(
 
 
 _modal_process_pdf_function: modal.Function | None = None
+_modal_embed_texts_function: modal.Function | None = None
 
 
 def get_modal_process_pdf_function() -> modal.Function:
@@ -164,6 +159,15 @@ def get_modal_process_pdf_function() -> modal.Function:
         _modal_process_pdf_function = modal.Function.from_name("studora-pdf-processor", "process_pdf")
 
     return _modal_process_pdf_function
+
+
+def get_modal_embed_texts_function() -> modal.Function:
+    global _modal_embed_texts_function
+
+    if _modal_embed_texts_function is None:
+        _modal_embed_texts_function = modal.Function.from_name("studora-pdf-processor", "embed_texts")
+
+    return _modal_embed_texts_function
 
 
 def call_modal_process_pdf(
@@ -184,6 +188,12 @@ def call_modal_process_pdf(
         max_chunk_tokens=settings.max_chunk_tokens,
         chunk_overlap_tokens=settings.chunk_overlap_tokens,
     )
+
+
+def call_modal_embed_texts(texts: list[str]) -> list[list[float]]:
+    """Runs BGE-small embedding on Modal so small Render instances never load
+    the embedding model or ONNX runtime into the web process."""
+    return get_modal_embed_texts_function().remote(texts=texts)
 
 
 def process_pdf_request(
@@ -583,13 +593,10 @@ def process_document(payload: ProcessRequest, settings: Settings = Depends(get_s
     )
 
 
-MAX_EMBED_TEXT_CHARS = 4000
-
-
 @app.post("/embed", response_model=EmbedResponse, dependencies=[Depends(require_internal_secret)])
 def embed(payload: EmbedRequest):
     texts = [text[:MAX_EMBED_TEXT_CHARS] for text in payload.texts]
-    embeddings = embed_texts(texts)
+    embeddings = call_modal_embed_texts(texts)
 
     return EmbedResponse(
         embeddings=embeddings,

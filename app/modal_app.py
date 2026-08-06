@@ -15,6 +15,8 @@ image = (
     .pip_install(
         "pymupdf==1.27.2.3",
         "httpx==0.28.1",
+        "fastembed==0.8.0",
+        "onnxruntime==1.27.0",
         "tiktoken==0.13.0",
         "regex==2026.5.9",
         "pydantic==2.13.4",
@@ -48,6 +50,8 @@ class _ExtractionSettings:
 
 FIRST_PAGE_THUMBNAIL_DPI = 120
 FIRST_PAGE_THUMBNAIL_MAX_WIDTH = 900
+EMBEDDING_MODEL_NAME = "BAAI/bge-small-en-v1.5"
+_embedding_model = None
 
 
 def render_first_page_thumbnail(pdf_path) -> str | None:
@@ -77,7 +81,7 @@ def render_first_page_thumbnail(pdf_path) -> str | None:
             document.close()
 
 
-@app.function(cpu=1.0, memory=2048, timeout=180)
+@app.function(cpu=2.0, memory=4096, timeout=300)
 def process_pdf(
     *,
     file_url: str,
@@ -132,3 +136,20 @@ def process_pdf(
     finally:
         if should_cleanup and pdf_path:
             pdf_path.unlink(missing_ok=True)
+
+
+def get_embedding_model():
+    global _embedding_model
+
+    if _embedding_model is None:
+        from fastembed import TextEmbedding
+
+        _embedding_model = TextEmbedding(model_name=EMBEDDING_MODEL_NAME)
+
+    return _embedding_model
+
+
+@app.function(cpu=1.0, memory=2048, timeout=120, scaledown_window=300)
+def embed_texts(*, texts: list[str]) -> list[list[float]]:
+    model = get_embedding_model()
+    return [embedding.tolist() for embedding in model.embed(texts)]
