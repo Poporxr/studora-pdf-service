@@ -181,15 +181,26 @@ def call_modal_process_pdf(
     """Runs download + PyMuPDF extraction + structure detection + chunking on
     Modal (its own dedicated container) instead of this shared instance, then
     returns plain JSON-safe dicts for sections/chunks/summaries."""
-    return get_modal_process_pdf_function().remote(
-        file_url=file_url,
-        include_summaries=include_summaries,
-        max_pdf_mb=max_pdf_mb,
-        max_pdf_pages=max_pdf_pages,
-        extraction_batch_pages=settings.extraction_batch_pages,
-        max_chunk_tokens=settings.max_chunk_tokens,
-        chunk_overlap_tokens=settings.chunk_overlap_tokens,
-    )
+    process_pdf = get_modal_process_pdf_function()
+    call_args = {
+        "file_url": file_url,
+        "max_pdf_mb": max_pdf_mb,
+        "max_pdf_pages": max_pdf_pages,
+        "extraction_batch_pages": settings.extraction_batch_pages,
+        "max_chunk_tokens": settings.max_chunk_tokens,
+        "chunk_overlap_tokens": settings.chunk_overlap_tokens,
+    }
+
+    if include_summaries:
+        return process_pdf.remote(**call_args)
+
+    try:
+        return process_pdf.remote(include_summaries=False, **call_args)
+    except TypeError as error:
+        if "include_summaries" not in str(error):
+            raise
+        logger.warning("Modal process_pdf does not accept include_summaries yet; retrying with legacy signature.")
+        return process_pdf.remote(**call_args)
 
 
 def call_modal_embed_texts(texts: list[str]) -> list[list[float]]:
