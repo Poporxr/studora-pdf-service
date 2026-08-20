@@ -173,6 +173,7 @@ def get_modal_embed_texts_function() -> modal.Function:
 def call_modal_process_pdf(
     *,
     file_url: str,
+    include_summaries: bool = True,
     max_pdf_mb: int,
     max_pdf_pages: int,
     settings: Settings,
@@ -182,6 +183,7 @@ def call_modal_process_pdf(
     returns plain JSON-safe dicts for sections/chunks/summaries."""
     return get_modal_process_pdf_function().remote(
         file_url=file_url,
+        include_summaries=include_summaries,
         max_pdf_mb=max_pdf_mb,
         max_pdf_pages=max_pdf_pages,
         extraction_batch_pages=settings.extraction_batch_pages,
@@ -240,13 +242,14 @@ def process_pdf_request(
 
             result = call_modal_process_pdf(
                 file_url=str(payload.file_url),
+                include_summaries=payload.include_summaries,
                 max_pdf_mb=max_pdf_mb,
                 max_pdf_pages=max_pdf_pages,
                 settings=settings,
             )
             sections = [ProcessedSection(**item) for item in result["sections"]]
             chunks = [ProcessedChunk(**item) for item in result["chunks"]]
-            summaries = [ProcessedSummary(**item) for item in result["summaries"]]
+            summaries = [ProcessedSummary(**item) for item in result.get("summaries", [])]
             page_count = result["pageCount"]
             text_chars = result["textChars"]
             warnings = list(result["warnings"])
@@ -361,7 +364,7 @@ def process_temporary_pdf_path(
     gc.collect()
     chunks = chunk_sections(sections, settings)
     processed_sections = [item.section for item in sections]
-    summaries = build_summaries(sections, chunks)
+    summaries = build_summaries(sections, chunks) if payload.include_summaries else []
     processing_status = get_processing_status(
         chunk_count=len(chunks),
         page_count=page_count,
@@ -425,13 +428,14 @@ def process_resource_progressive(
 
             result = call_modal_process_pdf(
                 file_url=str(payload.file_url),
+                include_summaries=payload.include_summaries,
                 max_pdf_mb=max_pdf_mb,
                 max_pdf_pages=max_pdf_pages,
                 settings=settings,
             )
             sections = [ProcessedSection(**item) for item in result["sections"]]
             chunks = [ProcessedChunk(**item) for item in result["chunks"]]
-            summaries = [ProcessedSummary(**item) for item in result["summaries"]]
+            summaries = [ProcessedSummary(**item) for item in result.get("summaries", [])]
             page_count = result["pageCount"]
             text_chars = result["textChars"]
             warnings = list(result["warnings"])

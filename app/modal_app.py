@@ -85,6 +85,7 @@ def render_first_page_thumbnail(pdf_path) -> str | None:
 def process_pdf(
     *,
     file_url: str,
+    include_summaries: bool = True,
     max_pdf_mb: int,
     max_pdf_pages: int,
     extraction_batch_pages: int,
@@ -121,7 +122,7 @@ def process_pdf(
         sections, warnings = detect_sections(pages)
         outline = build_outline(sections)
         chunks = chunk_sections(sections, settings)
-        summaries = build_summaries(sections, chunks)
+        summaries = build_summaries(sections, chunks) if include_summaries else []
 
         return {
             "sections": [item.section.model_dump(by_alias=True) for item in sections],

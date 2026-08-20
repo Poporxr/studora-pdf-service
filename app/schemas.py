@@ -9,6 +9,7 @@ class ProcessRequest(BaseModel):
     file_path: str | None = Field(default=None, alias="filePath")
     source: str = "unknown"
     persist: bool = True
+    include_summaries: bool = Field(default=True, alias="includeSummaries")
 
 
 class ProcessedChunk(BaseModel):
