@@ -10,6 +10,7 @@ class ProcessRequest(BaseModel):
     source: str = "unknown"
     persist: bool = True
     include_summaries: bool = Field(default=True, alias="includeSummaries")
+    include_thumbnail: bool = Field(default=True, alias="includeThumbnail")
 
 
 class ProcessedChunk(BaseModel):

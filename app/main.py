@@ -1,12 +1,10 @@
-import gc
 import logging
 from contextlib import nullcontext
 from time import perf_counter
 
 import modal
-from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile, status
+from fastapi import Depends, FastAPI, Header, HTTPException, status
 
-from app.chunking import chunk_sections
 from app.config import Settings, get_settings
 from app.db import (
     checkout_connection,
@@ -22,7 +20,6 @@ from app.db import (
     save_document_chunks,
     try_lock_document,
 )
-from app.extraction import extract_pdf_pages, prepare_uploaded_pdf_file
 from app.schemas import (
     EmbedRequest,
     EmbedResponse,
@@ -32,8 +29,6 @@ from app.schemas import (
     ProcessRequest,
     ProcessResponse,
 )
-from app.structure import detect_sections
-from app.summaries import build_summaries
 
 logger = logging.getLogger("studora_pdf_service")
 
@@ -174,6 +169,7 @@ def call_modal_process_pdf(
     *,
     file_url: str,
     include_summaries: bool = True,
+    include_thumbnail: bool = True,
     max_pdf_mb: int,
     max_pdf_pages: int,
     settings: Settings,
@@ -191,15 +187,19 @@ def call_modal_process_pdf(
         "chunk_overlap_tokens": settings.chunk_overlap_tokens,
     }
 
-    if include_summaries:
+    if include_summaries and include_thumbnail:
         return process_pdf.remote(**call_args)
 
     try:
-        return process_pdf.remote(include_summaries=False, **call_args)
+        return process_pdf.remote(
+            include_summaries=include_summaries,
+            include_thumbnail=include_thumbnail,
+            **call_args,
+        )
     except TypeError as error:
-        if "include_summaries" not in str(error):
+        if "include_summaries" not in str(error) and "include_thumbnail" not in str(error):
             raise
-        logger.warning("Modal process_pdf does not accept include_summaries yet; retrying with legacy signature.")
+        logger.warning("Modal process_pdf does not accept fast-path flags yet; retrying with legacy signature.")
         return process_pdf.remote(**call_args)
 
 
@@ -254,6 +254,7 @@ def process_pdf_request(
             result = call_modal_process_pdf(
                 file_url=str(payload.file_url),
                 include_summaries=payload.include_summaries,
+                include_thumbnail=payload.include_thumbnail,
                 max_pdf_mb=max_pdf_mb,
                 max_pdf_pages=max_pdf_pages,
                 settings=settings,
@@ -273,13 +274,14 @@ def process_pdf_request(
                 warnings=warnings,
             )
             logger.info(
-                "pdf structured uploadedDocumentId=%s sectionCount=%s chunkCount=%s summaryCount=%s status=%s warnings=%s elapsedSeconds=%.2f",
+                "pdf structured uploadedDocumentId=%s sectionCount=%s chunkCount=%s summaryCount=%s status=%s warnings=%s modalTimings=%s elapsedSeconds=%.2f",
                 payload.uploaded_document_id,
                 len(sections),
                 len(chunks),
                 len(summaries),
                 processing_status,
                 len(warnings),
+                result.get("timings"),
                 perf_counter() - started_at,
             )
 
@@ -349,57 +351,6 @@ def process_pdf_request(
             release_connection(settings.database_url, lock_connection)
 
 
-def process_temporary_pdf_path(
-    *,
-    payload: ProcessRequest,
-    pdf_path,
-    settings: Settings,
-    started_at: float,
-) -> ProcessResponse:
-    pages, page_count = extract_pdf_pages(
-        pdf_path,
-        settings,
-        max_pdf_pages=settings.temporary_max_pdf_pages,
-    )
-    text_chars = sum(len(page.text) for page in pages)
-    logger.info(
-        "temporary pdf extracted uploadedDocumentId=%s pageCount=%s textChars=%s elapsedSeconds=%.2f",
-        payload.uploaded_document_id,
-        page_count,
-        text_chars,
-        perf_counter() - started_at,
-    )
-
-    sections, warnings = detect_sections(pages)
-    del pages
-    gc.collect()
-    chunks = chunk_sections(sections, settings)
-    processed_sections = [item.section for item in sections]
-    summaries = build_summaries(sections, chunks) if payload.include_summaries else []
-    processing_status = get_processing_status(
-        chunk_count=len(chunks),
-        page_count=page_count,
-        section_count=len(processed_sections),
-        text_chars=text_chars,
-        warnings=warnings,
-    )
-
-    if not chunks:
-        raise ValueError("No extractable text chunks were found in this PDF.")
-
-    return ProcessResponse(
-        uploadedDocumentId=payload.uploaded_document_id,
-        status=processing_status,
-        pageCount=page_count,
-        sectionCount=len(processed_sections),
-        chunkCount=len(chunks),
-        chunks=chunks,
-        sections=processed_sections,
-        summaries=summaries,
-        warnings=warnings,
-    )
-
-
 def process_resource_progressive(
     payload: ProcessRequest,
     settings: Settings,
@@ -440,6 +391,7 @@ def process_resource_progressive(
             result = call_modal_process_pdf(
                 file_url=str(payload.file_url),
                 include_summaries=payload.include_summaries,
+                include_thumbnail=payload.include_thumbnail,
                 max_pdf_mb=max_pdf_mb,
                 max_pdf_pages=max_pdf_pages,
                 settings=settings,
@@ -451,12 +403,13 @@ def process_resource_progressive(
             text_chars = result["textChars"]
             warnings = list(result["warnings"])
             logger.info(
-                "pdf resource processed on modal uploadedDocumentId=%s pageCount=%s sectionCount=%s chunkCount=%s summaryCount=%s elapsedSeconds=%.2f",
+                "pdf resource processed on modal uploadedDocumentId=%s pageCount=%s sectionCount=%s chunkCount=%s summaryCount=%s modalTimings=%s elapsedSeconds=%.2f",
                 payload.uploaded_document_id,
                 page_count,
                 len(sections),
                 len(chunks),
                 len(summaries),
+                result.get("timings"),
                 perf_counter() - started_at,
             )
 
@@ -558,43 +511,11 @@ def extract_temporary(payload: ProcessRequest, settings: Settings = Depends(get_
 
 
 @app.post("/extract-temporary/upload", response_model=ProcessResponse, dependencies=[Depends(require_internal_secret)])
-async def extract_temporary_upload(
-    file: UploadFile = File(...),
-    uploaded_document_id: str = Form(default="temporary-upload", alias="uploadedDocumentId"),
-    source: str = Form(default="temporary-upload"),
-    settings: Settings = Depends(get_settings),
-):
-    started_at = perf_counter()
-    pdf_path = None
-
-    try:
-        payload = ProcessRequest(
-            uploadedDocumentId=uploaded_document_id,
-            source=source,
-            persist=False,
-        )
-        pdf_path = await prepare_uploaded_pdf_file(
-            file,
-            settings,
-            max_pdf_mb=settings.temporary_max_pdf_mb,
-        )
-        return process_temporary_pdf_path(
-            payload=payload,
-            pdf_path=pdf_path,
-            settings=settings,
-            started_at=started_at,
-        )
-    except Exception as error:
-        error_message = str(error) or "Temporary PDF extraction failed."
-        logger.exception(
-            "temporary pdf upload extraction failed uploadedDocumentId=%s error=%s",
-            uploaded_document_id,
-            error_message,
-        )
-        raise build_processing_http_error(error)
-    finally:
-        if pdf_path:
-            pdf_path.unlink(missing_ok=True)
+async def extract_temporary_upload():
+    raise HTTPException(
+        status_code=status.HTTP_410_GONE,
+        detail="Direct temporary uploads are disabled. Upload to R2 first and call /extract-temporary with a fileUrl so extraction runs on Modal.",
+    )
 
 
 @app.post("/process", response_model=ProcessResponse, dependencies=[Depends(require_internal_secret)])

@@ -10,13 +10,11 @@ Deploy with: modal deploy app/modal_app.py
 
 import modal
 
-image = (
+extraction_image = (
     modal.Image.debian_slim(python_version="3.13")
     .pip_install(
         "pymupdf==1.27.2.3",
         "httpx==0.28.1",
-        "fastembed==0.8.0",
-        "onnxruntime==1.27.0",
         "tiktoken==0.13.0",
         "regex==2026.5.9",
         "pydantic==2.13.4",
@@ -25,7 +23,15 @@ image = (
     .add_local_python_source("app")
 )
 
-app = modal.App("studora-pdf-processor", image=image)
+embedding_image = (
+    modal.Image.debian_slim(python_version="3.13")
+    .pip_install(
+        "fastembed==0.8.0",
+        "onnxruntime==1.27.0",
+    )
+)
+
+app = modal.App("studora-pdf-processor")
 
 
 class _ExtractionSettings:
@@ -81,17 +87,20 @@ def render_first_page_thumbnail(pdf_path) -> str | None:
             document.close()
 
 
-@app.function(cpu=2.0, memory=4096, timeout=300)
+@app.function(cpu=4.0, memory=8192, timeout=300, image=extraction_image)
 def process_pdf(
     *,
     file_url: str,
     include_summaries: bool = True,
+    include_thumbnail: bool = True,
     max_pdf_mb: int,
     max_pdf_pages: int,
     extraction_batch_pages: int,
     max_chunk_tokens: int,
     chunk_overlap_tokens: int,
 ) -> dict:
+    from time import perf_counter
+
     from app.chunking import chunk_sections
     from app.extraction import extract_pdf_pages, prepare_pdf_file
     from app.structure import build_outline, detect_sections
@@ -107,22 +116,44 @@ def process_pdf(
 
     pdf_path = None
     should_cleanup = False
+    started_at = perf_counter()
+    timings: dict[str, int] = {}
+
+    def mark(phase: str, phase_started_at: float) -> None:
+        timings[phase] = round((perf_counter() - phase_started_at) * 1000)
 
     try:
+        phase_started_at = perf_counter()
         pdf_path, should_cleanup = prepare_pdf_file(
             file_url,
             None,
             settings,
             max_pdf_mb=max_pdf_mb,
         )
-        thumbnail_base64 = render_first_page_thumbnail(pdf_path)
+        mark("downloadMs", phase_started_at)
+
+        phase_started_at = perf_counter()
+        thumbnail_base64 = render_first_page_thumbnail(pdf_path) if include_thumbnail else None
+        mark("thumbnailMs", phase_started_at)
+
+        phase_started_at = perf_counter()
         pages, page_count = extract_pdf_pages(pdf_path, settings, max_pdf_pages=max_pdf_pages)
         text_chars = sum(len(page.text) for page in pages)
+        mark("extractMs", phase_started_at)
 
+        phase_started_at = perf_counter()
         sections, warnings = detect_sections(pages)
         outline = build_outline(sections)
+        mark("structureMs", phase_started_at)
+
+        phase_started_at = perf_counter()
         chunks = chunk_sections(sections, settings)
+        mark("chunkMs", phase_started_at)
+
+        phase_started_at = perf_counter()
         summaries = build_summaries(sections, chunks) if include_summaries else []
+        mark("summaryMs", phase_started_at)
+        timings["totalMs"] = round((perf_counter() - started_at) * 1000)
 
         return {
             "sections": [item.section.model_dump(by_alias=True) for item in sections],
@@ -132,6 +163,7 @@ def process_pdf(
             "pageCount": page_count,
             "textChars": text_chars,
             "thumbnailBase64": thumbnail_base64,
+            "timings": timings,
             "warnings": warnings,
         }
     finally:
@@ -150,7 +182,7 @@ def get_embedding_model():
     return _embedding_model
 
 
-@app.function(cpu=1.0, memory=2048, timeout=120, scaledown_window=300)
+@app.function(cpu=2.0, memory=4096, timeout=120, scaledown_window=300, image=embedding_image)
 def embed_texts(*, texts: list[str]) -> list[list[float]]:
     model = get_embedding_model()
     return [embedding.tolist() for embedding in model.embed(texts)]
