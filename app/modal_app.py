@@ -10,6 +10,9 @@ Deploy with: modal deploy app/modal_app.py
 
 import modal
 
+MAX_EXTRACTION_BATCH_PAGES = 30
+MARKITDOWN_CONVERTER_VERSION = "markitdown-v2-text-fast-path"
+
 extraction_image = (
     modal.Image.debian_slim(python_version="3.13")
     .pip_install(
@@ -28,6 +31,15 @@ embedding_image = (
     .pip_install(
         "fastembed==0.8.0",
         "onnxruntime==1.27.0",
+    )
+)
+
+markitdown_image = (
+    modal.Image.debian_slim(python_version="3.13")
+    .pip_install(
+        "httpx==0.28.1",
+        "markitdown[pdf,docx,pptx,xlsx]==0.1.7",
+        "regex==2026.5.9",
     )
 )
 
@@ -102,14 +114,14 @@ def process_pdf(
     from time import perf_counter
 
     from app.chunking import chunk_sections
-    from app.extraction import extract_pdf_pages, prepare_pdf_file
+    from app.extraction import extract_pdf_page_batches, prepare_pdf_file
     from app.structure import build_outline, detect_sections
     from app.summaries import build_summaries
 
     settings = _ExtractionSettings(
         max_pdf_mb=max_pdf_mb,
         max_pdf_pages=max_pdf_pages,
-        extraction_batch_pages=extraction_batch_pages,
+        extraction_batch_pages=max(1, min(extraction_batch_pages, MAX_EXTRACTION_BATCH_PAGES)),
         max_chunk_tokens=max_chunk_tokens,
         chunk_overlap_tokens=chunk_overlap_tokens,
     )
@@ -117,7 +129,7 @@ def process_pdf(
     pdf_path = None
     should_cleanup = False
     started_at = perf_counter()
-    timings: dict[str, int] = {}
+    timings: dict[str, object] = {}
 
     def mark(phase: str, phase_started_at: float) -> None:
         timings[phase] = round((perf_counter() - phase_started_at) * 1000)
@@ -137,9 +149,28 @@ def process_pdf(
         mark("thumbnailMs", phase_started_at)
 
         phase_started_at = perf_counter()
-        pages, page_count = extract_pdf_pages(pdf_path, settings, max_pdf_pages=max_pdf_pages)
+        pages = []
+        page_count = 0
+        batch_timings = []
+        for batch, page_count, start_page, end_page in extract_pdf_page_batches(
+            pdf_path,
+            settings,
+            max_pdf_pages=max_pdf_pages,
+            batch_pages=settings.extraction_batch_pages,
+        ):
+            pages.extend(batch)
+            batch_timings.append(
+                {
+                    "endPage": end_page,
+                    "pageCount": len(batch),
+                    "startPage": start_page,
+                }
+            )
         text_chars = sum(len(page.text) for page in pages)
         mark("extractMs", phase_started_at)
+        timings["extractBatchCount"] = len(batch_timings)
+        timings["extractMaxBatchPages"] = settings.extraction_batch_pages
+        timings["extractBatches"] = batch_timings
 
         phase_started_at = perf_counter()
         sections, warnings = detect_sections(pages)
@@ -186,3 +217,164 @@ def get_embedding_model():
 def embed_texts(*, texts: list[str]) -> list[list[float]]:
     model = get_embedding_model()
     return [embedding.tolist() for embedding in model.embed(texts)]
+
+
+@app.function(cpu=4.0, memory=8192, timeout=300, image=markitdown_image)
+def convert_markitdown_v2(
+    *,
+    file_url: str,
+    file_suffix: str,
+    max_file_mb: int,
+    max_chunk_tokens: int,
+    chunk_overlap_tokens: int,
+) -> dict:
+    import hashlib
+    import re
+    import tempfile
+    from pathlib import Path
+    from time import perf_counter
+    from uuid import uuid4
+
+    import httpx
+    from markitdown import MarkItDown
+
+    allowed_suffixes = {".pdf", ".docx", ".pptx", ".xlsx", ".html", ".htm", ".txt", ".md", ".csv", ".json", ".xml", ".epub"}
+    normalized_suffix = file_suffix.lower() if file_suffix.startswith(".") else f".{file_suffix.lower()}"
+    if normalized_suffix not in allowed_suffixes:
+        raise ValueError(f"Unsupported MarkItDown file type: {normalized_suffix}")
+
+    max_bytes = max_file_mb * 1024 * 1024
+    downloaded = 0
+    timings: dict[str, int] = {}
+    started_at = perf_counter()
+    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=normalized_suffix)
+    temp_path = Path(temp_file.name)
+
+    def mark(phase: str, phase_started_at: float) -> None:
+        timings[phase] = round((perf_counter() - phase_started_at) * 1000)
+
+    def clean_markdown(text: str) -> str:
+        cleaned = text.replace("\x00", " ")
+        cleaned = re.sub(r"[ \t]+", " ", cleaned)
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+        return cleaned.strip()
+
+    def split_markdown_chunks(text: str) -> list[dict]:
+        words = re.findall(r"\S+", text)
+        chunk_words = max(80, max_chunk_tokens)
+        overlap_words = max(0, min(chunk_overlap_tokens, chunk_words // 3))
+        chunks = []
+        index = 0
+        previous_id = None
+
+        while index < len(words):
+            chunk_id = str(uuid4())
+            end = min(index + chunk_words, len(words))
+            chunk_text = " ".join(words[index:end]).strip()
+            if not chunk_text:
+                break
+
+            chunk = {
+                "id": chunk_id,
+                "chunkIndex": len(chunks),
+                "pageStart": 1,
+                "pageEnd": 1,
+                "sectionId": section_id,
+                "text": chunk_text,
+                "tokenCount": len(chunk_text.split()),
+                "contentPreview": re.sub(r"\s+", " ", chunk_text).strip()[:240],
+                "previousChunkId": previous_id,
+                "nextChunkId": None,
+                "chunkHash": hashlib.sha256(chunk_text.encode("utf-8")).hexdigest(),
+                "heading": "Converted document",
+                "headingPath": ["Converted document"],
+                "sectionNumber": None,
+                "metadata": {
+                    "converter": "markitdown",
+                    "converterVersion": MARKITDOWN_CONVERTER_VERSION,
+                    "fileSuffix": normalized_suffix,
+                    "source": "markitdown",
+                },
+            }
+            if chunks:
+                chunks[-1]["nextChunkId"] = chunk_id
+            chunks.append(chunk)
+            previous_id = chunk_id
+
+            if end >= len(words):
+                break
+            index = max(end - overlap_words, index + 1)
+
+        return chunks
+
+    try:
+        phase_started_at = perf_counter()
+        with temp_file:
+            with httpx.Client(timeout=60, follow_redirects=True) as client:
+                with client.stream("GET", file_url) as response:
+                    response.raise_for_status()
+                    for chunk in response.iter_bytes():
+                        if not chunk:
+                            continue
+                        downloaded += len(chunk)
+                        if downloaded > max_bytes:
+                            raise ValueError(f"File is larger than the configured {max_file_mb}MB limit.")
+                        temp_file.write(chunk)
+        mark("downloadMs", phase_started_at)
+
+        phase_started_at = perf_counter()
+        if normalized_suffix in {".txt", ".md", ".csv", ".json", ".xml"}:
+            markdown = clean_markdown(temp_path.read_bytes().decode("utf-8", errors="replace"))
+        else:
+            markdown = clean_markdown(MarkItDown(enable_plugins=False).convert(str(temp_path)).text_content)
+        mark("convertMs", phase_started_at)
+
+        if not markdown:
+            raise ValueError("MarkItDown did not extract readable text from this file.")
+
+        section_id = str(uuid4())
+        section = {
+            "id": section_id,
+            "parentSectionId": None,
+            "level": 1,
+            "title": "Converted document",
+            "headingPath": ["Converted document"],
+            "pageStart": 1,
+            "pageEnd": 1,
+            "sortOrder": 0,
+            "confidence": 0.5,
+            "metadata": {
+                "converter": "markitdown",
+                "converterVersion": MARKITDOWN_CONVERTER_VERSION,
+                "fileSuffix": normalized_suffix,
+            },
+        }
+
+        phase_started_at = perf_counter()
+        chunks = split_markdown_chunks(markdown)
+        mark("chunkMs", phase_started_at)
+        timings["totalMs"] = round((perf_counter() - started_at) * 1000)
+
+        return {
+            "sections": [section],
+            "chunks": chunks,
+            "summaries": [],
+            "outline": [
+                {
+                    "id": section["id"],
+                    "level": section["level"],
+                    "title": section["title"],
+                    "headingPath": section["headingPath"],
+                    "pageStart": section["pageStart"],
+                    "pageEnd": section["pageEnd"],
+                    "confidence": section["confidence"],
+                }
+            ],
+            "pageCount": 1,
+            "textChars": len(markdown),
+            "thumbnailBase64": None,
+            "timings": timings,
+            "warnings": [f"Converted with {MARKITDOWN_CONVERTER_VERSION} experimental path."],
+        }
+    finally:
+        temp_path.unlink(missing_ok=True)

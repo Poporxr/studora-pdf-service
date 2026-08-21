@@ -145,6 +145,7 @@ def get_processing_status(
 
 _modal_process_pdf_function: modal.Function | None = None
 _modal_embed_texts_function: modal.Function | None = None
+_modal_convert_markitdown_function: modal.Function | None = None
 
 
 def get_modal_process_pdf_function() -> modal.Function:
@@ -163,6 +164,15 @@ def get_modal_embed_texts_function() -> modal.Function:
         _modal_embed_texts_function = modal.Function.from_name("studora-pdf-processor", "embed_texts")
 
     return _modal_embed_texts_function
+
+
+def get_modal_convert_markitdown_function() -> modal.Function:
+    global _modal_convert_markitdown_function
+
+    if _modal_convert_markitdown_function is None:
+        _modal_convert_markitdown_function = modal.Function.from_name("studora-pdf-processor", "convert_markitdown_v2")
+
+    return _modal_convert_markitdown_function
 
 
 def call_modal_process_pdf(
@@ -207,6 +217,32 @@ def call_modal_embed_texts(texts: list[str]) -> list[list[float]]:
     """Runs BGE-small embedding on Modal so small Render instances never load
     the embedding model or ONNX runtime into the web process."""
     return get_modal_embed_texts_function().remote(texts=texts)
+
+
+def get_file_suffix(payload: ProcessRequest) -> str:
+    if payload.file_path:
+        suffix = payload.file_path.rsplit(".", 1)[-1] if "." in payload.file_path else ""
+        return f".{suffix}" if suffix else ""
+
+    path = str(payload.file_url).split("?", 1)[0] if payload.file_url else ""
+    suffix = path.rsplit(".", 1)[-1] if "." in path else ""
+    return f".{suffix}" if suffix else ".pdf"
+
+
+def call_modal_convert_markitdown(
+    *,
+    file_url: str,
+    file_suffix: str,
+    max_file_mb: int,
+    settings: Settings,
+) -> dict:
+    return get_modal_convert_markitdown_function().remote(
+        file_url=file_url,
+        file_suffix=file_suffix,
+        max_file_mb=max_file_mb,
+        max_chunk_tokens=settings.max_chunk_tokens,
+        chunk_overlap_tokens=settings.chunk_overlap_tokens,
+    )
 
 
 def process_pdf_request(
@@ -539,3 +575,65 @@ def embed(payload: EmbedRequest):
         dimensions=EMBEDDING_DIMENSIONS,
         model=EMBEDDING_MODEL_NAME,
     )
+
+
+@app.post("/convert-markitdown", response_model=ProcessResponse, dependencies=[Depends(require_internal_secret)])
+def convert_with_markitdown(payload: ProcessRequest, settings: Settings = Depends(get_settings)):
+    if not payload.file_url:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="fileUrl is required for MarkItDown conversion.",
+        )
+
+    try:
+        started_at = perf_counter()
+        result = call_modal_convert_markitdown(
+            file_url=str(payload.file_url),
+            file_suffix=get_file_suffix(payload),
+            max_file_mb=settings.temporary_max_pdf_mb if not payload.persist else settings.max_pdf_mb,
+            settings=settings,
+        )
+        sections = [ProcessedSection(**item) for item in result["sections"]]
+        chunks = [ProcessedChunk(**item) for item in result["chunks"]]
+        summaries = [ProcessedSummary(**item) for item in result.get("summaries", [])]
+        warnings = list(result.get("warnings", []))
+        text_chars = result["textChars"]
+        processing_status = get_processing_status(
+            chunk_count=len(chunks),
+            page_count=result["pageCount"],
+            section_count=len(sections),
+            text_chars=text_chars,
+            warnings=warnings,
+        )
+        logger.info(
+            "markitdown converted uploadedDocumentId=%s suffix=%s sectionCount=%s chunkCount=%s status=%s modalTimings=%s elapsedSeconds=%.2f",
+            payload.uploaded_document_id,
+            get_file_suffix(payload),
+            len(sections),
+            len(chunks),
+            processing_status,
+            result.get("timings"),
+            perf_counter() - started_at,
+        )
+
+        if not chunks:
+            raise ValueError("No extractable text chunks were found in this file.")
+
+        return ProcessResponse(
+            uploadedDocumentId=payload.uploaded_document_id,
+            status=processing_status,
+            pageCount=result["pageCount"],
+            sectionCount=len(sections),
+            chunkCount=len(chunks),
+            chunks=chunks,
+            sections=sections,
+            summaries=summaries,
+            warnings=warnings,
+        )
+    except Exception as error:
+        logger.exception(
+            "markitdown conversion failed uploadedDocumentId=%s error=%s",
+            payload.uploaded_document_id,
+            str(error) or "MarkItDown conversion failed.",
+        )
+        raise build_processing_http_error(error)
