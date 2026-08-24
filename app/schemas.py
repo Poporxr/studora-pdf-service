@@ -13,6 +13,52 @@ class ProcessRequest(BaseModel):
     include_thumbnail: bool = Field(default=True, alias="includeThumbnail")
 
 
+class ThumbnailRequest(BaseModel):
+    uploaded_document_id: str = Field(alias="uploadedDocumentId")
+    file_url: HttpUrl = Field(alias="fileUrl")
+    source: str = "unknown"
+
+
+class ThumbnailResponse(BaseModel):
+    uploaded_document_id: str = Field(alias="uploadedDocumentId")
+    thumbnail_base64: str | None = Field(default=None, alias="thumbnailBase64")
+    warnings: list[str] = Field(default_factory=list)
+
+    model_config = {"populate_by_name": True}
+
+
+class PreviewUploadTarget(BaseModel):
+    page_number: int = Field(alias="pageNumber")
+    upload_url: HttpUrl = Field(alias="uploadUrl")
+    image_key: str = Field(alias="imageKey")
+    image_url: str = Field(alias="imageUrl")
+
+
+class PreviewPageResult(BaseModel):
+    page_number: int = Field(alias="pageNumber")
+    image_key: str = Field(alias="imageKey")
+    image_url: str = Field(alias="imageUrl")
+    width: int
+    height: int
+    blurhash: str | None = None
+
+
+class PreviewRequest(BaseModel):
+    uploaded_document_id: str = Field(alias="uploadedDocumentId")
+    file_url: HttpUrl = Field(alias="fileUrl")
+    source: str = "unknown"
+    max_pages: int = Field(default=10, alias="maxPages")
+    upload_targets: list[PreviewUploadTarget] = Field(alias="uploadTargets")
+
+
+class PreviewResponse(BaseModel):
+    uploaded_document_id: str = Field(alias="uploadedDocumentId")
+    pages: list[PreviewPageResult]
+    warnings: list[str] = Field(default_factory=list)
+
+    model_config = {"populate_by_name": True}
+
+
 class ProcessedChunk(BaseModel):
     id: str | None = None
     chunk_index: int = Field(alias="chunkIndex")

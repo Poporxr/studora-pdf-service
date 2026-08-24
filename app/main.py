@@ -23,11 +23,16 @@ from app.db import (
 from app.schemas import (
     EmbedRequest,
     EmbedResponse,
+    PreviewRequest,
+    PreviewResponse,
+    PreviewPageResult,
     ProcessedChunk,
     ProcessedSection,
     ProcessedSummary,
     ProcessRequest,
     ProcessResponse,
+    ThumbnailRequest,
+    ThumbnailResponse,
 )
 
 logger = logging.getLogger("studora_pdf_service")
@@ -146,6 +151,8 @@ def get_processing_status(
 _modal_process_pdf_function: modal.Function | None = None
 _modal_embed_texts_function: modal.Function | None = None
 _modal_convert_markitdown_function: modal.Function | None = None
+_modal_render_pdf_thumbnail_function: modal.Function | None = None
+_modal_render_pdf_previews_function: modal.Function | None = None
 
 
 def get_modal_process_pdf_function() -> modal.Function:
@@ -164,6 +171,24 @@ def get_modal_embed_texts_function() -> modal.Function:
         _modal_embed_texts_function = modal.Function.from_name("studora-pdf-processor", "embed_texts")
 
     return _modal_embed_texts_function
+
+
+def get_modal_render_pdf_thumbnail_function() -> modal.Function:
+    global _modal_render_pdf_thumbnail_function
+
+    if _modal_render_pdf_thumbnail_function is None:
+        _modal_render_pdf_thumbnail_function = modal.Function.from_name("studora-pdf-processor", "render_pdf_thumbnail")
+
+    return _modal_render_pdf_thumbnail_function
+
+
+def get_modal_render_pdf_previews_function() -> modal.Function:
+    global _modal_render_pdf_previews_function
+
+    if _modal_render_pdf_previews_function is None:
+        _modal_render_pdf_previews_function = modal.Function.from_name("studora-pdf-processor", "render_pdf_previews")
+
+    return _modal_render_pdf_previews_function
 
 
 def get_modal_convert_markitdown_function() -> modal.Function:
@@ -217,6 +242,36 @@ def call_modal_embed_texts(texts: list[str]) -> list[list[float]]:
     """Runs BGE-small embedding on Modal so small Render instances never load
     the embedding model or ONNX runtime into the web process."""
     return get_modal_embed_texts_function().remote(texts=texts)
+
+
+def call_modal_render_pdf_thumbnail(
+    *,
+    file_url: str,
+    max_pdf_mb: int,
+    max_pdf_pages: int,
+) -> dict:
+    return get_modal_render_pdf_thumbnail_function().remote(
+        file_url=file_url,
+        max_pdf_mb=max_pdf_mb,
+        max_pdf_pages=max_pdf_pages,
+    )
+
+
+def call_modal_render_pdf_previews(
+    *,
+    file_url: str,
+    upload_targets: list[dict],
+    max_pages: int,
+    max_pdf_mb: int,
+    max_pdf_pages: int,
+) -> dict:
+    return get_modal_render_pdf_previews_function().remote(
+        file_url=file_url,
+        upload_targets=upload_targets,
+        max_pages=max_pages,
+        max_pdf_mb=max_pdf_mb,
+        max_pdf_pages=max_pdf_pages,
+    )
 
 
 def get_file_suffix(payload: ProcessRequest) -> str:
@@ -321,9 +376,6 @@ def process_pdf_request(
                 perf_counter() - started_at,
             )
 
-            if not chunks:
-                raise ValueError("No extractable text chunks were found in this PDF.")
-
             if lock_connection:
                 save_document_chunks(
                     lock_connection,
@@ -355,6 +407,7 @@ def process_pdf_request(
                 chunks=[] if persist else chunks,
                 sections=[] if persist else sections,
                 summaries=[] if persist else summaries,
+                thumbnailBase64=result.get("thumbnailBase64"),
                 warnings=warnings,
             )
     except Exception as error:
@@ -456,9 +509,6 @@ def process_resource_progressive(
                 text_chars=text_chars,
                 warnings=warnings,
             )
-            if not chunks:
-                raise ValueError("No extractable text chunks were found in this PDF.")
-
             insert_document_sections(lock_connection, payload.uploaded_document_id, sections)
             insert_document_chunks(lock_connection, payload.uploaded_document_id, chunks)
             insert_document_summaries(lock_connection, payload.uploaded_document_id, summaries)
@@ -523,6 +573,84 @@ def process_resource_progressive(
     finally:
         if lock_connection:
             release_connection(settings.database_url, lock_connection)
+
+
+@app.post("/thumbnail", response_model=ThumbnailResponse, dependencies=[Depends(require_internal_secret)])
+def generate_thumbnail(payload: ThumbnailRequest, settings: Settings = Depends(get_settings)):
+    warnings: list[str] = []
+
+    try:
+        result = call_modal_render_pdf_thumbnail(
+            file_url=str(payload.file_url),
+            max_pdf_mb=settings.max_pdf_mb,
+            max_pdf_pages=settings.max_pdf_pages,
+        )
+        thumbnail_base64 = result.get("thumbnailBase64")
+        if not thumbnail_base64:
+            warnings.append("Thumbnail renderer did not return an image.")
+
+        logger.info(
+            "pdf thumbnail generated uploadedDocumentId=%s source=%s hasThumbnail=%s modalTimings=%s",
+            payload.uploaded_document_id,
+            payload.source,
+            bool(thumbnail_base64),
+            result.get("timings"),
+        )
+
+        return ThumbnailResponse(
+            uploadedDocumentId=payload.uploaded_document_id,
+            thumbnailBase64=thumbnail_base64,
+            warnings=warnings,
+        )
+    except Exception as error:
+        logger.exception(
+            "pdf thumbnail generation failed uploadedDocumentId=%s error=%s",
+            payload.uploaded_document_id,
+            str(error) or "Thumbnail generation failed.",
+        )
+        raise build_processing_http_error(error)
+
+
+@app.post("/previews", response_model=PreviewResponse, dependencies=[Depends(require_internal_secret)])
+def generate_previews(payload: PreviewRequest, settings: Settings = Depends(get_settings)):
+    try:
+        result = call_modal_render_pdf_previews(
+            file_url=str(payload.file_url),
+            upload_targets=[
+                {
+                    **target.model_dump(by_alias=True),
+                    "uploadUrl": str(target.upload_url),
+                }
+                for target in payload.upload_targets
+            ],
+            max_pages=max(1, min(payload.max_pages, 10)),
+            max_pdf_mb=settings.max_pdf_mb,
+            max_pdf_pages=settings.max_pdf_pages,
+        )
+        pages = [PreviewPageResult(**item) for item in result.get("pages", [])]
+        warnings = list(result.get("warnings", []))
+
+        logger.info(
+            "pdf previews generated uploadedDocumentId=%s source=%s pageCount=%s modalTimings=%s warnings=%s",
+            payload.uploaded_document_id,
+            payload.source,
+            len(pages),
+            result.get("timings"),
+            len(warnings),
+        )
+
+        return PreviewResponse(
+            uploadedDocumentId=payload.uploaded_document_id,
+            pages=pages,
+            warnings=warnings,
+        )
+    except Exception as error:
+        logger.exception(
+            "pdf preview generation failed uploadedDocumentId=%s error=%s",
+            payload.uploaded_document_id,
+            str(error) or "Preview generation failed.",
+        )
+        raise build_processing_http_error(error)
 
 
 @app.post("/process-resource", response_model=ProcessResponse, dependencies=[Depends(require_internal_secret)])

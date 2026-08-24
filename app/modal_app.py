@@ -68,6 +68,9 @@ class _ExtractionSettings:
 
 FIRST_PAGE_THUMBNAIL_DPI = 120
 FIRST_PAGE_THUMBNAIL_MAX_WIDTH = 900
+PREVIEW_PAGE_DPI = 132
+PREVIEW_PAGE_MAX_WIDTH = 1100
+PREVIEW_JPEG_QUALITY = 74
 EMBEDDING_MODEL_NAME = "BAAI/bge-small-en-v1.5"
 _embedding_model = None
 
@@ -97,6 +100,17 @@ def render_first_page_thumbnail(pdf_path) -> str | None:
     finally:
         if document is not None:
             document.close()
+
+
+def render_page_jpeg(page) -> tuple[bytes, int, int]:
+    import fitz
+
+    zoom = PREVIEW_PAGE_DPI / 72
+    if page.rect.width > 0:
+        zoom = min(zoom, PREVIEW_PAGE_MAX_WIDTH / page.rect.width)
+
+    pixmap = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+    return pixmap.tobytes("jpeg", jpg_quality=PREVIEW_JPEG_QUALITY), pixmap.width, pixmap.height
 
 
 @app.function(cpu=4.0, memory=8192, timeout=300, image=extraction_image)
@@ -196,6 +210,137 @@ def process_pdf(
             "thumbnailBase64": thumbnail_base64,
             "timings": timings,
             "warnings": warnings,
+        }
+    finally:
+        if should_cleanup and pdf_path:
+            pdf_path.unlink(missing_ok=True)
+
+
+@app.function(cpu=2.0, memory=4096, timeout=120, image=extraction_image)
+def render_pdf_thumbnail(
+    *,
+    file_url: str,
+    max_pdf_mb: int,
+    max_pdf_pages: int,
+) -> dict:
+    from time import perf_counter
+
+    from app.extraction import prepare_pdf_file
+
+    settings = _ExtractionSettings(
+        max_pdf_mb=max_pdf_mb,
+        max_pdf_pages=max_pdf_pages,
+        extraction_batch_pages=1,
+        max_chunk_tokens=800,
+        chunk_overlap_tokens=120,
+    )
+
+    pdf_path = None
+    should_cleanup = False
+    started_at = perf_counter()
+
+    try:
+        pdf_path, should_cleanup = prepare_pdf_file(
+            file_url,
+            None,
+            settings,
+            max_pdf_mb=max_pdf_mb,
+        )
+        thumbnail_base64 = render_first_page_thumbnail(pdf_path)
+
+        return {
+            "thumbnailBase64": thumbnail_base64,
+            "timings": {
+                "totalMs": round((perf_counter() - started_at) * 1000),
+            },
+        }
+    finally:
+        if should_cleanup and pdf_path:
+            pdf_path.unlink(missing_ok=True)
+
+
+@app.function(cpu=4.0, memory=4096, timeout=120, image=extraction_image)
+def render_pdf_previews(
+    *,
+    file_url: str,
+    upload_targets: list[dict],
+    max_pages: int,
+    max_pdf_mb: int,
+    max_pdf_pages: int,
+) -> dict:
+    from time import perf_counter
+
+    import fitz
+    import httpx
+
+    from app.extraction import prepare_pdf_file
+
+    settings = _ExtractionSettings(
+        max_pdf_mb=max_pdf_mb,
+        max_pdf_pages=max_pdf_pages,
+        extraction_batch_pages=1,
+        max_chunk_tokens=800,
+        chunk_overlap_tokens=120,
+    )
+
+    pdf_path = None
+    should_cleanup = False
+    started_at = perf_counter()
+    pages: list[dict] = []
+    warnings: list[str] = []
+
+    try:
+        pdf_path, should_cleanup = prepare_pdf_file(
+            file_url,
+            None,
+            settings,
+            max_pdf_mb=max_pdf_mb,
+        )
+
+        targets_by_page = {
+            int(target["pageNumber"]): target
+            for target in upload_targets[: max(0, max_pages)]
+            if int(target.get("pageNumber", 0) or 0) > 0
+        }
+        if not targets_by_page:
+            return {"pages": [], "warnings": ["No preview upload targets were provided."], "timings": {"totalMs": 0}}
+
+        document = fitz.open(pdf_path)
+        try:
+            page_limit = min(document.page_count, max_pages, max(targets_by_page))
+            with httpx.Client(timeout=60, follow_redirects=True) as client:
+                for page_number in range(1, page_limit + 1):
+                    target = targets_by_page.get(page_number)
+                    if not target:
+                        continue
+
+                    page = document.load_page(page_number - 1)
+                    image_bytes, width, height = render_page_jpeg(page)
+                    response = client.put(
+                        str(target["uploadUrl"]),
+                        content=image_bytes,
+                        headers={"Content-Type": "image/jpeg"},
+                    )
+                    response.raise_for_status()
+                    pages.append(
+                        {
+                            "pageNumber": page_number,
+                            "imageKey": target["imageKey"],
+                            "imageUrl": target["imageUrl"],
+                            "width": width,
+                            "height": height,
+                            "blurhash": None,
+                        }
+                    )
+        finally:
+            document.close()
+
+        return {
+            "pages": pages,
+            "warnings": warnings,
+            "timings": {
+                "totalMs": round((perf_counter() - started_at) * 1000),
+            },
         }
     finally:
         if should_cleanup and pdf_path:
