@@ -1,8 +1,8 @@
 """
 Runs the CPU/memory-heavy part of PDF processing (download, PyMuPDF
 extraction, structure detection, chunking, summaries) on Modal instead of
-the shared Render instance. Pure compute only: no database access, no
-secrets. main.py calls `process_pdf.remote(...)` and gets back plain JSON,
+the shared Render instance. Pure compute only: no database access.
+main.py calls `process_pdf.remote(...)` and gets back plain JSON,
 then does the exact same Postgres writes it always did.
 
 Deploy with: modal deploy app/modal_app.py
@@ -12,6 +12,7 @@ import modal
 
 MAX_EXTRACTION_BATCH_PAGES = 30
 MARKITDOWN_CONVERTER_VERSION = "markitdown-v2-text-fast-path"
+AZURE_OCR_SECRET_NAME = "studora-azure-ocr"
 
 extraction_image = (
     modal.Image.debian_slim(python_version="3.13")
@@ -22,6 +23,8 @@ extraction_image = (
         "regex==2026.5.9",
         "pydantic==2.13.4",
         "pydantic-settings==2.14.1",
+        "azure-ai-documentintelligence==1.0.2",
+        "azure-core==1.37.0",
     )
     .add_local_python_source("app")
 )
@@ -113,7 +116,13 @@ def render_page_jpeg(page) -> tuple[bytes, int, int]:
     return pixmap.tobytes("jpeg", jpg_quality=PREVIEW_JPEG_QUALITY), pixmap.width, pixmap.height
 
 
-@app.function(cpu=4.0, memory=8192, timeout=300, image=extraction_image)
+@app.function(
+    cpu=4.0,
+    memory=8192,
+    timeout=300,
+    image=extraction_image,
+    secrets=[modal.Secret.from_name(AZURE_OCR_SECRET_NAME)],
+)
 def process_pdf(
     *,
     file_url: str,
@@ -128,6 +137,7 @@ def process_pdf(
     from time import perf_counter
 
     from app.chunking import chunk_sections
+    from app.azure_ocr import analyze_pdf_with_azure_ocr, should_run_azure_ocr
     from app.extraction import extract_pdf_page_batches, prepare_pdf_file
     from app.structure import build_outline, detect_sections
     from app.summaries import build_summaries
@@ -194,6 +204,46 @@ def process_pdf(
         phase_started_at = perf_counter()
         chunks = chunk_sections(sections, settings)
         mark("chunkMs", phase_started_at)
+
+        if should_run_azure_ocr(
+            chunk_count=len(chunks),
+            page_count=page_count,
+            text_chars=text_chars,
+        ):
+            phase_started_at = perf_counter()
+            try:
+                ocr_result = analyze_pdf_with_azure_ocr(pdf_path)
+                if ocr_result.pages:
+                    pages = ocr_result.pages
+                    page_count = max(page_count, len(pages))
+                    text_chars = ocr_result.text_chars
+
+                    sections, ocr_structure_warnings = detect_sections(pages)
+                    for section_item in sections:
+                        section_item.section.metadata = {
+                            **section_item.section.metadata,
+                            "ocrEngine": "azure-document-intelligence",
+                            "ocrSource": "fallback",
+                        }
+                    outline = build_outline(sections)
+                    chunks = chunk_sections(sections, settings)
+                    for chunk in chunks:
+                        chunk.metadata = {
+                            **chunk.metadata,
+                            "ocrEngine": "azure-document-intelligence",
+                            "ocrSource": "fallback",
+                        }
+                    warnings = [
+                        *warnings,
+                        "Native PDF extraction was sparse; used Azure OCR fallback.",
+                        *ocr_result.warnings,
+                        *ocr_structure_warnings,
+                    ]
+                else:
+                    warnings.extend(ocr_result.warnings)
+            except Exception as error:
+                warnings.append(f"Azure OCR fallback failed: {error}")
+            mark("ocrMs", phase_started_at)
 
         phase_started_at = perf_counter()
         summaries = build_summaries(sections, chunks) if include_summaries else []
